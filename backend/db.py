@@ -3,6 +3,10 @@
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 def get_conn():
@@ -25,6 +29,9 @@ def get_conn():
     dbname = os.getenv("PGDATABASE", "rebar_db")
     user = os.getenv("PGUSER", "rebar_user")
     password = os.getenv("PGPASSWORD", "")
+
+    # Optional: Add debug print to verify variables are loaded
+    # print(f"Connecting to {host}:{port}/{dbname} as {user}")
 
     conn = psycopg2.connect(
         host=host,
@@ -102,3 +109,4 @@ def init_db():
 
     conn.commit()
     conn.close()
+    print("✅ Database initialized successfully!")
