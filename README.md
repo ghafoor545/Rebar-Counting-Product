@@ -62,14 +62,21 @@ Rebar Counting Product/
 - Node.js 18+ & npm
 - PostgreSQL 15+ (running locally)
 - (Optional) OAK camera (OAK-D / OAK-1 etc.) + DepthAI drivers
+- 
+### Virtual Environment Setup
 
-### 1. Backend Setup
-```powershell
-# Activate virtual environment
-.\venv\Scripts\Activate.ps1
+**Windows**  
+Create: `python -m venv venv`  
+Activate (PowerShell): `.\venv\Scripts\Activate.ps1`  
+Activate (cmd): `venv\Scripts\activate.bat`
 
-# Install dependencies
-pip install -r requirement.txt
+**Linux / macOS**  
+Create: `python3 -m venv venv`  
+Activate: `source venv/bin/activate`
+
+Deactivate (both): `deactivate`
+
+After activation: `pip install -r requirements.txt`
 
 
 3. Frontend Setup
