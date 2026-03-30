@@ -1,57 +1,81 @@
+# backend/services/detector.py
 import os
 import uuid
 import base64
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
+
 import numpy as np
 import cv2
 import requests
 import onnxruntime as ort
 from sklearn.cluster import DBSCAN
+
 from backend.core.config import MODEL_PATH, DET_DIR, THUMB_DIR
 from backend.db import get_conn
 from backend.utils.utils import utc_now_iso
 
+
+# ------------------------------------------------------------------
 # Bundle Detector Class
+# ------------------------------------------------------------------
 class RebarBundleDetector:
     """
-    Detects bundles of rebars based on proximity clustering
-    Bundle definition: 5 or more rebars close to each other
-    Less than 5 rebars together are considered isolated
+    Detects bundles of rebars based on proximity clustering.
 
-    ID Assignment Rules:
-        Each bundle has its own separate numbering (1,2,3... within the bundle)
-        Within each bundle: IDs assigned row-wise, left to right
-        Isolated rebars: sequential numbers (continuing from bundles)
+    Bundle definition: min_bundle_size or more rebars close to each other.
+    Less than min_bundle_size rebars together are considered isolated.
+
+    FIX (bundle counting):
+      DBSCAN can "absorb" border points into a cluster. We prune weakly connected
+      members inside each candidate bundle by requiring min neighbor count.
+
+    Supports segmentation ONNX:
+      output0: [B, no, anchors]  (e.g. [1, 37, 8400])
+      output1: [B, nm, mh, mw]   (e.g. [1, 32, 160, 160])
+
+    Visualization:
+      - Different color mask for each instance
+      - Bounding box colored to match mask
+      - IMPORTANT: masks are HARD-CLIPPED to each bbox in original image space
+        to remove rainbow noise in background.
     """
 
     def __init__(
         self,
-        eps: float = 100.0,  # Distance threshold for clustering (pixels)
-        min_bundle_size: int = 5,  # Minimum rebars to form a bundle
-        min_samples: int = 2,  # Min samples for DBSCAN
-        row_tolerance: float = 40.0,  # Pixel tolerance for same row
-        use_adaptive_eps: bool = True,  # Use adaptive eps based on rebar sizes
+        eps: float = 1.0,
+        min_bundle_size: int = 5,
+        min_samples: int = 4,
+        row_tolerance: float = 10.0,
+        use_adaptive_eps: bool = True,
+        min_neighbors_in_bundle: Optional[int] = None,
+        # segmentation overlay
+        draw_seg_masks: bool = True,
+        seg_mask_thresh: float = 0.55,
+        seg_mask_alpha: float = 0.35,
+        draw_mask_contours: bool = True,
+        mask_contour_thickness: int = 2,
+        # debug
+        debug: bool = False,
     ):
         self.eps = eps
         self.min_bundle_size = min_bundle_size
         self.min_samples = min_samples
         self.row_tolerance = row_tolerance
         self.use_adaptive_eps = use_adaptive_eps
+        self.min_neighbors_in_bundle = min_neighbors_in_bundle
+
+        self.draw_seg_masks = draw_seg_masks
+        self.seg_mask_thresh = seg_mask_thresh
+        self.seg_mask_alpha = seg_mask_alpha
+        self.draw_mask_contours = draw_mask_contours
+        self.mask_contour_thickness = mask_contour_thickness
+
+        self.debug = debug
 
     # ------------------------------------------------------------------
     # Bundle clustering
     # ------------------------------------------------------------------
     def detect_bundles(self, boxes: np.ndarray) -> Dict[str, Any]:
-        """
-        Detect bundles from detected rebar boxes and assign bundle-specific IDs.
-        IDs are assigned left-to-right in rows, top-to-bottom WITHIN EACH BUNDLE.
-
-        Args:
-            boxes: Array of bounding boxes in format [x1, y1, x2, y2]
-
-        Returns:
-            Dictionary containing bundle information with simple ID mapping
-        """
         if len(boxes) == 0:
             return {
                 "bundles": [],
@@ -69,93 +93,114 @@ class RebarBundleDetector:
                 },
             }
 
-        # Calculate centers and sizes of all boxes
         centers, sizes = self._get_box_centers_and_sizes(boxes)
 
-        # Calculate adaptive eps based on rebar sizes if enabled
-        eps_to_use = self.eps
-        if self.use_adaptive_eps:
-            avg_size = np.mean(sizes)
-            eps_to_use = max(self.eps, avg_size * 2.5)  # At least 2.5x average rebar size
+        eps_to_use = float(self.eps)
+        if self.use_adaptive_eps and len(sizes):
+            avg_size = float(np.mean(sizes))
+            eps_to_use = max(float(self.eps), avg_size * 0.10)
 
-        # Perform clustering using DBSCAN with adaptive eps
-        clustering = DBSCAN(eps=eps_to_use, min_samples=self.min_samples).fit(centers)
+        clustering = DBSCAN(eps=eps_to_use, min_samples=int(self.min_samples)).fit(centers)
         labels = clustering.labels_
 
-        # Count rebars in each cluster
         unique, counts = np.unique(labels, return_counts=True)
-        cluster_sizes = dict(zip(unique, counts))
+        cluster_sizes = dict(zip(unique.tolist(), counts.tolist()))
 
-        bundles = []
-        isolated_rebars = []
-        id_mapping = {}
-        unique_labels = set(labels)
+        bundle_clusters = [
+            label
+            for label in set(labels.tolist())
+            if label != -1 and cluster_sizes.get(label, 0) >= int(self.min_bundle_size)
+        ]
+
+        bundles: List[Dict[str, Any]] = []
+        isolated_rebars: List[Dict[str, Any]] = []
+        id_mapping: Dict[int, Dict[str, Any]] = {}
         bundle_counter = 0
 
-        # Identify clusters that are bundles (5+ rebars)
-        bundle_clusters = []
-        for label in unique_labels:
-            if label != -1 and cluster_sizes[label] >= self.min_bundle_size:
-                bundle_clusters.append(label)
+        # Everything starts unassigned; only accepted bundle members are removed.
+        unassigned = set(range(len(boxes)))
 
-        # Process bundles
+        min_neighbors = (
+            (int(self.min_samples) - 1)
+            if self.min_neighbors_in_bundle is None
+            else int(self.min_neighbors_in_bundle)
+        )
+        min_neighbors = max(1, min_neighbors)
+
+        # ---- Process bundles with pruning ----
         for label in bundle_clusters:
             cluster_indices = np.where(labels == label)[0]
-            cluster_size = len(cluster_indices)
-            bundle_counter += 1
-            cluster_boxes = boxes[cluster_indices]
+            if len(cluster_indices) == 0:
+                continue
+
             cluster_centers = centers[cluster_indices]
 
-            # Sort rebars within bundle row-wise then left-to-right
+            # Neighbor counts inside cluster (within eps_to_use)
+            diff = cluster_centers[:, None, :] - cluster_centers[None, :, :]
+            dist = np.sqrt((diff ** 2).sum(axis=2))
+            neighbor_counts = (dist <= eps_to_use).sum(axis=1) - 1  # exclude self
+
+            keep_local = neighbor_counts >= min_neighbors
+            kept_indices = cluster_indices[keep_local]
+
+            # If pruning makes it too small, not a bundle
+            if len(kept_indices) < int(self.min_bundle_size):
+                continue
+
+            bundle_counter += 1
+            kept_centers = centers[kept_indices]
+            kept_boxes = boxes[kept_indices]
+            cluster_size = int(len(kept_indices))
+
             sorted_indices = self._sort_rebars_rowwise_left_to_right(
-                cluster_indices, cluster_centers
+                kept_indices, kept_centers
             )
 
             bundle_rebars = []
             for bundle_idx, global_idx in enumerate(sorted_indices, start=1):
-                rebar_info = {
-                    "global_index": int(global_idx),
-                    "bundle_index": bundle_idx,
-                    "display_id": bundle_idx,
-                    "box": boxes[global_idx].tolist(),
-                    "center": centers[global_idx].tolist(),
-                    "row": self._get_row_number(centers[global_idx], cluster_centers),
-                }
-                bundle_rebars.append(rebar_info)
+                bundle_rebars.append(
+                    {
+                        "global_index": int(global_idx),
+                        "bundle_index": int(bundle_idx),
+                        "display_id": int(bundle_idx),
+                        "box": boxes[global_idx].tolist(),
+                        "center": centers[global_idx].tolist(),
+                        "row": self._get_row_number(centers[global_idx], kept_centers),
+                    }
+                )
                 id_mapping[int(global_idx)] = {
-                    "display_id": bundle_idx,
-                    "bundle_id": bundle_counter,
-                    "bundle_index": bundle_idx,
+                    "display_id": int(bundle_idx),
+                    "bundle_id": int(bundle_counter),
+                    "bundle_index": int(bundle_idx),
                     "type": "bundle",
-                    "group_size": cluster_size,
+                    "group_size": int(cluster_size),
                 }
 
-            all_x1 = boxes[cluster_indices, 0]
-            all_y1 = boxes[cluster_indices, 1]
-            all_x2 = boxes[cluster_indices, 2]
-            all_y2 = boxes[cluster_indices, 3]
+            all_x1 = kept_boxes[:, 0]
+            all_y1 = kept_boxes[:, 1]
+            all_x2 = kept_boxes[:, 2]
+            all_y2 = kept_boxes[:, 3]
 
-            bundle_info = {
-                "bundle_id": bundle_counter,
-                "size": cluster_size,
-                "rebars": bundle_rebars,
-                "global_indices": sorted_indices.tolist(),
-                "bounds": [
-                    float(np.min(all_x1)),
-                    float(np.min(all_y1)),
-                    float(np.max(all_x2)),
-                    float(np.max(all_y2)),
-                ],
-            }
-            bundles.append(bundle_info)
+            bundles.append(
+                {
+                    "bundle_id": int(bundle_counter),
+                    "size": int(cluster_size),
+                    "rebars": bundle_rebars,
+                    "global_indices": sorted_indices.tolist(),
+                    "bounds": [
+                        float(np.min(all_x1)),
+                        float(np.min(all_y1)),
+                        float(np.max(all_x2)),
+                        float(np.max(all_y2)),
+                    ],
+                }
+            )
 
-        # Handle isolated rebars (those not in any bundle)
-        all_processed_indices = set()
-        for bundle in bundles:
-            all_processed_indices.update(bundle["global_indices"])
+            for gi in kept_indices.tolist():
+                unassigned.discard(int(gi))
 
-        isolated_indices = [i for i in range(len(boxes)) if i not in all_processed_indices]
-
+        # ---- Isolated = everything not accepted into a bundle ----
+        isolated_indices = sorted(list(unassigned))
         if isolated_indices:
             isolated_centers = centers[isolated_indices]
             sorted_isolated = self._sort_rebars_rowwise_left_to_right(
@@ -163,49 +208,47 @@ class RebarBundleDetector:
             )
 
             for display_idx, global_idx in enumerate(sorted_isolated, start=1):
-                rebar_info = {
-                    "global_index": int(global_idx),
-                    "display_id": display_idx,
-                    "box": boxes[global_idx].tolist(),
-                    "center": centers[global_idx].tolist(),
-                    "type": "isolated",
-                    "group_size": 1,
-                }
-                isolated_rebars.append(rebar_info)
+                isolated_rebars.append(
+                    {
+                        "global_index": int(global_idx),
+                        "display_id": int(display_idx),
+                        "box": boxes[global_idx].tolist(),
+                        "center": centers[global_idx].tolist(),
+                        "type": "isolated",
+                        "group_size": 1,
+                    }
+                )
                 id_mapping[int(global_idx)] = {
-                    "display_id": display_idx,
+                    "display_id": int(display_idx),
                     "type": "isolated",
                     "group_size": 1,
                 }
 
-        total_rebars_in_bundles = sum(b["size"] for b in bundles)
-        total_isolated = len(isolated_rebars)
+        total_rebars_in_bundles = int(sum(b["size"] for b in bundles))
+        total_isolated = int(len(isolated_rebars))
 
         return {
             "bundles": bundles,
             "isolated_rebars": isolated_rebars,
-            "total_bundles": len(bundles),
+            "total_bundles": int(len(bundles)),
             "total_rebars_in_bundles": total_rebars_in_bundles,
             "total_isolated": total_isolated,
-            "total_count": len(boxes),
+            "total_count": int(len(boxes)),
             "id_mapping": id_mapping,
             "display_summary": {
-                "total": len(boxes),
-                "bundles": len(bundles),
+                "total": int(len(boxes)),
+                "bundles": int(len(bundles)),
                 "rebars_in_bundles": total_rebars_in_bundles,
                 "isolated": total_isolated,
             },
         }
 
     def _sort_rebars_rowwise_left_to_right(self, indices, centers):
-        """
-        Sort rebars by row (top to bottom) and left to right within each row
-        """
         if len(indices) <= 1:
             return indices
 
         pairs = list(zip(indices, centers))
-        pairs.sort(key=lambda x: x[1][1])  # sort by y
+        pairs.sort(key=lambda x: x[1][1])  # by y
 
         rows = []
         current_row = []
@@ -228,27 +271,23 @@ class RebarBundleDetector:
         return np.array(rows)
 
     def _get_row_number(self, center, all_centers):
-        """Determine which row this rebar belongs to within its cluster"""
-        y_coords = sorted(set([c[1] for c in all_centers]))
+        y_coords = sorted(set([float(c[1]) for c in all_centers]))
         for i, y in enumerate(y_coords):
-            if abs(center[1] - y) <= self.row_tolerance:
+            if abs(float(center[1]) - y) <= self.row_tolerance:
                 return i + 1
         return 0
 
-    def _get_box_centers_and_sizes(
-        self, boxes: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Calculate centers and approximate sizes of bounding boxes"""
+    def _get_box_centers_and_sizes(self, boxes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         centers = []
         sizes = []
         for box in boxes:
             x1, y1, x2, y2 = box[:4]
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
             centers.append([cx, cy])
             size = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
             sizes.append(size)
-        return np.array(centers), np.array(sizes)
+        return np.array(centers, dtype=np.float32), np.array(sizes, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Detection helpers & ONNX inference
@@ -282,14 +321,17 @@ class RebarBundleDetector:
         shape = im.shape[:2]  # (h, w)
         if isinstance(new_shape, int):
             new_shape = (new_shape, new_shape)
+
         r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
         new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
         dw = new_shape[1] - new_unpad[0]
         dh = new_shape[0] - new_unpad[1]
         dw /= 2
         dh /= 2
+
         if shape[::-1] != new_unpad:
             im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+
         top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
         left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
         im = cv2.copyMakeBorder(
@@ -307,9 +349,10 @@ class RebarBundleDetector:
 
     def scale_boxes(self, boxes, r, dwdh, orig_shape):
         left, top = dwdh
-        boxes[:, [0, 2]] -= left
-        boxes[:, [1, 3]] -= top
-        boxes[:, :4] /= r
+        boxes = boxes.copy()
+        boxes[:, [0, 2]] -= float(left)
+        boxes[:, [1, 3]] -= float(top)
+        boxes[:, :4] /= float(r)
         h, w = orig_shape[:2]
         boxes[:, 0] = np.clip(boxes[:, 0], 0, w - 1)
         boxes[:, 1] = np.clip(boxes[:, 1], 0, h - 1)
@@ -348,54 +391,26 @@ class RebarBundleDetector:
         a = np.asarray(arr)
         if a.size == 0:
             return a
-        mn, mx = np.min(a), np.max(a)
+        mn, mx = float(np.min(a)), float(np.max(a))
         if 0.0 <= mn and mx <= 1.0:
             return a
         return self.sigmoid(a)
 
     def parse_onnx_outputs(self, outs):
         arrs = [np.asarray(o) for o in outs]
-        # YOLO-NAS / ultralytics NMS-like outputs
+
+        # ---- YOLO Segmentation ONNX: (pred, proto) ----
+        if len(arrs) == 2 and arrs[0].ndim == 3 and arrs[1].ndim == 4:
+            return "seg", (arrs[0], arrs[1])
+
+        # ---- NMS-like outputs ----
         for a in arrs:
             if a.ndim == 3 and a.shape[-1] == 6:
                 return "nms", (a[0] if a.shape[0] == 1 else a)
             if a.ndim == 2 and a.shape[-1] == 6:
                 return "nms", a
-        # "boxes + scores + classes" style
-        num = None
-        boxes = None
-        scores = None
-        classes = None
-        for a in arrs:
-            if a.ndim == 1 and a.size == 1:
-                try:
-                    num = int(a.reshape(-1)[0])
-                except Exception:
-                    pass
-        for a in arrs:
-            if a.ndim >= 2 and a.shape[-1] == 4:
-                b = a[0] if a.ndim == 3 else a
-                boxes = b.astype(np.float32)
-        for a in arrs:
-            if a.ndim >= 1 and a.shape[-1] != 4 and a.dtype.kind in "fc":
-                s = a[0] if a.ndim == 2 else a
-                if s.ndim == 1:
-                    scores = s.astype(np.float32)
-        for a in arrs:
-            if a.ndim >= 1 and a.shape[-1] != 4:
-                c = a[0] if a.ndim == 2 else a
-                if c.ndim == 1:
-                    classes = np.round(c).astype(np.int32)
-        if boxes is not None and scores is not None and classes is not None:
-            N = min(len(boxes), len(scores), len(classes))
-            if num is not None and 0 < num <= N:
-                N = num
-            dets = np.zeros((N, 6), dtype=np.float32)
-            dets[:, :4] = boxes[:N]
-            dets[:, 4] = scores[:N]
-            dets[:, 5] = classes[:N]
-            return "nms", dets
-        # Fallback: raw YOLO-style outputs [B, anchors, C]
+
+        # ---- fallback raw outputs ----
         z = arrs[0]
         if z.ndim == 3:
             if z.shape[1] < z.shape[2]:
@@ -408,6 +423,9 @@ class RebarBundleDetector:
         return "raw", z
 
     def preprocess_for_onnx(self, image_bgr, in_hw):
+        if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
+            raise ValueError("preprocess_for_onnx: empty image (None)")
+
         in_h, in_w = in_hw
         lb, r, dwdh = self.letterbox(image_bgr, (in_h, in_w))
         img = cv2.cvtColor(lb, cv2.COLOR_BGR2RGB)
@@ -416,174 +434,254 @@ class RebarBundleDetector:
         img = np.expand_dims(img, 0)
         return img, r, dwdh
 
+    # ------------------------------------------------------------------
+    # Segmentation masks (decoded + HARD-CLIPPED to bbox)
+    # ------------------------------------------------------------------
+    def decode_seg_masks(
+        self,
+        coeffs: np.ndarray,          # [N, nm]
+        proto: np.ndarray,           # [nm, mh, mw]
+        boxes_xyxy_orig: np.ndarray, # [N, 4] in ORIGINAL image coords (after scale_boxes + NMS)
+        r: float,
+        dwdh: Tuple[float, float],
+        orig_shape,
+        in_hw: Tuple[int, int],
+        mask_thresh: float = 0.5,
+    ) -> List[np.ndarray]:
+        """
+        Decode YOLO-seg masks and HARD-CLIP each mask to its own bounding box in original image space.
+        This removes the background rainbow noise completely.
+        """
+        if coeffs is None or len(coeffs) == 0:
+            return []
+
+        in_h, in_w = in_hw
+        orig_h, orig_w = orig_shape[:2]
+        left, top = map(int, dwdh)
+
+        proto = proto.astype(np.float32)      # [nm, mh, mw]
+        coeffs = coeffs.astype(np.float32)    # [N, nm]
+
+        nm, mh, mw = proto.shape
+        proto_flat = proto.reshape(nm, -1)    # [nm, mh*mw]
+
+        # masks at proto resolution: [N, mh, mw]
+        masks = self.sigmoid(coeffs @ proto_flat).reshape(-1, mh, mw)
+
+        # content size in model-input after letterbox
+        new_w = int(round(orig_w * float(r)))
+        new_h = int(round(orig_h * float(r)))
+
+        out_masks: List[np.ndarray] = []
+        for i, m in enumerate(masks):
+            # 1) upsample proto mask -> model input size (e.g., 640x640)
+            m_in = cv2.resize(m, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
+
+            # 2) remove padding -> get mask on resized-content area
+            x1p = max(left, 0)
+            y1p = max(top, 0)
+            x2p = min(left + new_w, in_w)
+            y2p = min(top + new_h, in_h)
+            if x2p <= x1p or y2p <= y1p:
+                out_masks.append(np.zeros((orig_h, orig_w), dtype=bool))
+                continue
+
+            m_crop = m_in[y1p:y2p, x1p:x2p]
+
+            # 3) resize to original image size
+            m_orig = cv2.resize(m_crop, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            m_bin = (m_orig >= float(mask_thresh))
+
+            # 4) HARD CLIP mask to its bbox in ORIGINAL image coords (key fix)
+            bx1, by1, bx2, by2 = boxes_xyxy_orig[i]
+            x1 = int(max(0, np.floor(bx1)))
+            y1 = int(max(0, np.floor(by1)))
+            x2 = int(min(orig_w, np.ceil(bx2)))
+            y2 = int(min(orig_h, np.ceil(by2)))
+
+            # zero everything outside the box
+            if y1 > 0:
+                m_bin[:y1, :] = False
+            if y2 < orig_h:
+                m_bin[y2:, :] = False
+            if x1 > 0:
+                m_bin[:, :x1] = False
+            if x2 < orig_w:
+                m_bin[:, x2:] = False
+
+            out_masks.append(m_bin)
+
+        return out_masks
+
+    def _color_for_index(self, i: int) -> Tuple[int, int, int]:
+        """
+        Deterministic vivid BGR color for instance i (OpenCV uses BGR).
+        """
+        h = int((i * 37) % 180)  # 0..179 in OpenCV HSV
+        hsv = np.uint8([[[h, 255, 255]]])
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+        return int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+    def _overlay_instance_masks(
+        self,
+        image_bgr: np.ndarray,
+        masks: List[np.ndarray],
+        colors: List[Tuple[int, int, int]],
+        alpha: float,
+        draw_contours: bool,
+        contour_thickness: int,
+    ) -> np.ndarray:
+        out = image_bgr.copy()
+
+        for i, m in enumerate(masks):
+            if m is None:
+                continue
+            if m.dtype != np.bool_:
+                m = m.astype(bool)
+            if not np.any(m):
+                continue
+
+            color = colors[i]
+
+            # alpha blend only on mask pixels
+            out[m] = (
+                out[m].astype(np.float32) * (1.0 - float(alpha))
+                + np.array(color, dtype=np.float32) * float(alpha)
+            ).astype(np.uint8)
+
+            if draw_contours:
+                mu8 = (m.astype(np.uint8) * 255)
+                contours, _ = cv2.findContours(mu8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    cv2.drawContours(out, contours, -1, color, int(contour_thickness))
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Drawing
+    # ------------------------------------------------------------------
     def draw_simple_black_frame(self, img, summary):
-        """
-        Draw a simple small black frame in top-left corner with white text
-        """
-        height, width = img.shape[:2]
         frame_width = 220
         frame_height = 140
         x1, y1 = 10, 10
         x2, y2 = x1 + frame_width, y1 + frame_height
+
         overlay = img.copy()
         cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
-        alpha = 0.7
-        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+        cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
         cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 1)
+
         title = "REBAR ANALYSIS"
         font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(
-            img, title, (x1 + 15, y1 + 25), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA
-        )
-        # separator
+        cv2.putText(img, title, (x1 + 15, y1 + 25), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.line(img, (x1 + 10, y1 + 35), (x2 - 10, y1 + 35), (255, 255, 255), 1)
+
         y_offset = y1 + 50
         line_height = 18
-        cv2.putText(
-            img,
-            f"TOTAL: {summary['total']}",
-            (x1 + 15, y_offset),
-            font,
-            0.4,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(img, f"TOTAL: {summary['total']}", (x1 + 15, y_offset), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         y_offset += line_height
-        cv2.putText(
-            img,
-            f"BUNDLES: {summary['bundles']}",
-            (x1 + 15, y_offset),
-            font,
-            0.4,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(img, f"BUNDLES: {summary['bundles']}", (x1 + 15, y_offset), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         y_offset += line_height
-        cv2.putText(
-            img,
-            f"IN BUNDLES: {summary['rebars_in_bundles']}",
-            (x1 + 15, y_offset),
-            font,
-            0.4,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(img, f"IN BUNDLES: {summary['rebars_in_bundles']}", (x1 + 15, y_offset), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         y_offset += line_height
-        cv2.putText(
-            img,
-            f"ISOLATED: {summary['isolated']}",
-            (x1 + 15, y_offset),
-            font,
-            0.4,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(img, f"ISOLATED: {summary['isolated']}", (x1 + 15, y_offset), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         return img
 
-    def draw_centered_ids_with_bundles(self, image_bgr, boxes, bundle_info=None):
+    def draw_centered_ids_with_bundles(self, image_bgr, boxes, bundle_info=None, box_colors=None):
         """
-        Draw centered IDs on detected boxes, with optional bundle info overlay.
+        Draw per-instance colored bounding boxes (if box_colors provided),
+        centered IDs, and summary frame.
         """
         img = image_bgr.copy()
         img_height, img_width = img.shape[:2]
 
-        # Draw all boxes
-        for box in boxes:
+        # Draw all boxes (instance-colored)
+        for i, box in enumerate(boxes):
             x1, y1, x2, y2 = map(int, box[:4])
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            if box_colors is not None and i < len(box_colors) and box_colors[i] is not None:
+                color = tuple(map(int, box_colors[i]))
+            else:
+                color = (0, 255, 0)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
-        if bundle_info and bundle_info["total_count"] > 0:
-            # Use bundle_info id_mapping
+        # Draw IDs using bundle mapping
+        if bundle_info and bundle_info.get("total_count", 0) > 0:
             for global_idx, id_info in bundle_info["id_mapping"].items():
                 if global_idx < len(boxes):
                     box = boxes[global_idx]
                     x1, y1, x2, y2 = map(int, box[:4])
-                    box_width = x2 - x1
-                    box_height = y2 - y1
-                    box_size = min(box_width, box_height)
+                    box_w = x2 - x1
+                    box_h = y2 - y1
+                    box_size = min(box_w, box_h)
 
                     if box_size < 25:
-                        font_scale = 0.25
-                        thickness = 1
+                        font_scale, thickness = 0.25, 1
                     elif box_size < 40:
-                        font_scale = 0.3
-                        thickness = 1
+                        font_scale, thickness = 0.30, 1
                     elif box_size < 70:
-                        font_scale = 0.35
-                        thickness = 1
+                        font_scale, thickness = 0.35, 1
                     elif box_size < 120:
-                        font_scale = 0.4
-                        thickness = 2
+                        font_scale, thickness = 0.40, 2
                     elif box_size < 200:
-                        font_scale = 0.5
-                        thickness = 2
+                        font_scale, thickness = 0.50, 2
                     else:
-                        font_scale = 0.6
-                        thickness = 2
+                        font_scale, thickness = 0.60, 2
 
                     display_id = str(id_info["display_id"])
                     cx = int((x1 + x2) / 2)
                     cy = int((y1 + y2) / 2)
+
                     font = cv2.FONT_HERSHEY_SIMPLEX
-                    (text_w, text_h), _ = cv2.getTextSize(
-                        display_id, font, font_scale, thickness
-                    )
+                    (tw, th), _ = cv2.getTextSize(display_id, font, font_scale, thickness)
                     padding = max(2, int(font_scale * 3))
-                    bg_x1 = max(0, cx - text_w // 2 - padding)
-                    bg_y1 = max(0, cy - text_h // 2 - padding)
-                    bg_x2 = min(img_width, cx + text_w // 2 + padding)
-                    bg_y2 = min(img_height, cy + text_h // 2 + padding)
+
+                    bg_x1 = max(0, cx - tw // 2 - padding)
+                    bg_y1 = max(0, cy - th // 2 - padding)
+                    bg_x2 = min(img_width, cx + tw // 2 + padding)
+                    bg_y2 = min(img_height, cy + th // 2 + padding)
 
                     cv2.rectangle(img, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
                     cv2.putText(
                         img,
                         display_id,
-                        (cx - text_w // 2, cy + text_h // 2),
+                        (cx - tw // 2, cy + th // 2),
                         font,
                         font_scale,
                         (255, 255, 255),
                         thickness,
                         cv2.LINE_AA,
                     )
+
             img = self.draw_simple_black_frame(img, bundle_info["display_summary"])
         else:
-            # If no bundles: simple numbering
+            # simple numbering fallback
             for idx, box in enumerate(boxes, start=1):
                 x1, y1, x2, y2 = map(int, box[:4])
                 box_size = min(x2 - x1, y2 - y1)
 
                 if box_size < 30:
-                    font_scale = 0.3
-                    thickness = 1
+                    font_scale, thickness = 0.3, 1
                 elif box_size < 60:
-                    font_scale = 0.4
-                    thickness = 1
+                    font_scale, thickness = 0.4, 1
                 else:
-                    font_scale = 0.5
-                    thickness = 2
+                    font_scale, thickness = 0.5, 2
 
                 cx = int((x1 + x2) / 2)
                 cy = int((y1 + y2) / 2)
                 id_text = str(idx)
-                (text_w, text_h), _ = cv2.getTextSize(
-                    id_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
-                )
+                (tw, th), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
 
                 cv2.rectangle(
                     img,
-                    (cx - text_w // 2 - 2, cy - text_h // 2 - 2),
-                    (cx + text_w // 2 + 2, cy + text_h // 2 + 2),
+                    (cx - tw // 2 - 2, cy - th // 2 - 2),
+                    (cx + tw // 2 + 2, cy + th // 2 + 2),
                     (0, 0, 0),
                     -1,
                 )
                 cv2.putText(
                     img,
                     id_text,
-                    (cx - text_w // 2, cy + text_h // 2),
+                    (cx - tw // 2, cy + th // 2),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     font_scale,
                     (255, 255, 255),
@@ -601,18 +699,22 @@ class RebarBundleDetector:
 
         return img, boxes
 
+    # ------------------------------------------------------------------
+    # Core detect (supports DET + SEG ONNX)
+    # ------------------------------------------------------------------
     def detect_rebars(
         self,
         image_bgr,
         model,
         class_id: int = 0,
-        conf: float = 0.6,
+        conf: float = 0.25,
         iou: float = 0.5,
         max_det: int = 10000,
     ):
-        """
-        Core ONNX-based detection logic.
-        """
+        # Guard
+        if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
+            return None, 0, "Empty image (None) passed to detect_rebars()", None
+
         try:
             sess = model["sess"]
             in_name = model["in_name"]
@@ -623,8 +725,122 @@ class RebarBundleDetector:
             outs = sess.run(None, {in_name: blob})
             kind, data = self.parse_onnx_outputs(outs)
 
+            if self.debug:
+                print("[detect_rebars] kind=", kind, "outs shapes=", [np.asarray(o).shape for o in outs])
+
             dets_xyxy = []
-            if kind == "nms":
+            seg_masks: Optional[List[np.ndarray]] = None
+            instance_colors: Optional[List[Tuple[int, int, int]]] = None
+
+            # ------------------------
+            # SEGMENTATION branch
+            # ------------------------
+            if kind == "seg":
+                pred_raw, proto_raw = data
+                pred = pred_raw[0]   # [no, anchors] OR [anchors, no]
+                proto = proto_raw[0] # [nm, mh, mw]
+
+                # Your model output0 is [1, 37, anchors] => pred is [37, anchors] -> transpose
+                if pred.ndim != 2:
+                    raise ValueError(f"Unexpected seg pred ndim={pred.ndim}, shape={pred.shape}")
+                if pred.shape[0] <= 128 and pred.shape[1] > pred.shape[0]:
+                    pred = pred.T  # [anchors, 37]
+
+                pred = pred.astype(np.float32)
+                no = int(pred.shape[1])
+                nm = int(proto.shape[0])
+
+                # YOLO-seg typical: no = 4 + nc + nm  (your: 37=4+1+32)
+                nc = no - 4 - nm
+                if nc <= 0:
+                    nc = 1
+
+                boxes = pred[:, 0:4].copy()
+
+                # scores (class probability)
+                scores_mat = self.maybe_sigmoid(pred[:, 4 : 4 + nc])
+                if scores_mat.ndim == 1:
+                    scores_mat = scores_mat[:, None]
+                if int(class_id) >= scores_mat.shape[1]:
+                    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), 0, "class_id out of range", None
+                scores = scores_mat[:, int(class_id)]
+
+                # mask coeffs
+                coeff_start = 4 + nc
+                coeff_end = coeff_start + nm
+                if coeff_end > no:
+                    # fallback if export uses [x,y,w,h,conf,coeffs...]
+                    coeff_start = 5
+                    coeff_end = 5 + nm
+                coeffs = pred[:, coeff_start:coeff_end].copy()
+                if coeffs.shape[1] != nm:
+                    raise ValueError(f"Bad coeffs shape {coeffs.shape}, expected nm={nm}, no={no}")
+
+                # normalized -> pixels in model input
+                if np.nanmax(boxes) <= 1.5:
+                    boxes[:, [0, 2]] *= float(in_w)
+                    boxes[:, [1, 3]] *= float(in_h)
+
+                # decide xywh vs xyxy
+                b_xyxy_from_xywh = self.xywh2xyxy(boxes.copy())
+                valid1 = (
+                    (b_xyxy_from_xywh[:, 2] > b_xyxy_from_xywh[:, 0]) &
+                    (b_xyxy_from_xywh[:, 3] > b_xyxy_from_xywh[:, 1])
+                ).sum()
+                b_xyxy_as_is = boxes.copy()
+                valid2 = (
+                    (b_xyxy_as_is[:, 2] > b_xyxy_as_is[:, 0]) &
+                    (b_xyxy_as_is[:, 3] > b_xyxy_as_is[:, 1])
+                ).sum()
+                b_xyxy = b_xyxy_from_xywh if valid1 >= valid2 else b_xyxy_as_is
+
+                keep_mask = scores >= float(conf)
+                if np.any(keep_mask):
+                    b_xyxy = b_xyxy[keep_mask]
+                    s = scores[keep_mask]
+                    coeffs = coeffs[keep_mask]
+
+                    # scale to original image coords
+                    b_xyxy = self.scale_boxes(b_xyxy, r, dwdh, image_bgr.shape)
+
+                    # remove tiny
+                    wh = (b_xyxy[:, 2:4] - b_xyxy[:, 0:2]).clip(min=0)
+                    small = (wh[:, 0] < 4.0) | (wh[:, 1] < 4.0)
+                    if np.any(small):
+                        b_xyxy = b_xyxy[~small]
+                        s = s[~small]
+                        coeffs = coeffs[~small]
+
+                    if len(s) > max_det:
+                        topk = np.argsort(-s)[:max_det]
+                        b_xyxy = b_xyxy[topk]
+                        s = s[topk]
+                        coeffs = coeffs[topk]
+
+                    keep = self.nms(b_xyxy, s, iou_thres=float(iou), max_det=max_det)
+                    if keep:
+                        b_xyxy = b_xyxy[keep]
+                        coeffs = coeffs[keep]
+                        dets_xyxy = b_xyxy.tolist()
+
+                        if self.draw_seg_masks:
+                            # HARD-CLIP masks to bbox -> removes background rainbow
+                            seg_masks = self.decode_seg_masks(
+                                coeffs=coeffs,
+                                proto=proto,
+                                boxes_xyxy_orig=b_xyxy,  # IMPORTANT
+                                r=float(r),
+                                dwdh=dwdh,
+                                orig_shape=image_bgr.shape,
+                                in_hw=in_hw,
+                                mask_thresh=float(self.seg_mask_thresh),
+                            )
+                            instance_colors = [self._color_for_index(i) for i in range(len(seg_masks))]
+
+            # ------------------------
+            # DETECTION (NMS-like) branch
+            # ------------------------
+            elif kind == "nms":
                 d = data.reshape(-1, 6).astype(np.float32)
                 cls = np.round(d[:, 5]).astype(np.int32)
                 scr = d[:, 4]
@@ -636,17 +852,23 @@ class RebarBundleDetector:
                         b[:, [1, 3]] *= float(in_h)
                     b = self.scale_boxes(b, r, dwdh, image_bgr.shape)
                     dets_xyxy = b.tolist()
+
+            # ------------------------
+            # DETECTION (raw YOLO-style) branch
+            # ------------------------
             else:
-                C = data.shape[1]
-                boxes = data[:, :4].astype(np.float32)
+                z = data
+                C = z.shape[1]
+                boxes = z[:, :4].astype(np.float32)
+
                 scores_mat_a = None
                 scores_mat_b = None
 
                 if C - 4 > 0:
-                    scores_mat_a = self.maybe_sigmoid(data[:, 4:])
+                    scores_mat_a = self.maybe_sigmoid(z[:, 4:])
                 if C - 5 > 0:
-                    obj = self.maybe_sigmoid(data[:, 4:5])
-                    cls_b = self.maybe_sigmoid(data[:, 5:])
+                    obj = self.maybe_sigmoid(z[:, 4:5])
+                    cls_b = self.maybe_sigmoid(z[:, 5:])
                     scores_mat_b = obj * cls_b
 
                 def count_above(m, t=0.25):
@@ -657,21 +879,12 @@ class RebarBundleDetector:
 
                 scores_mat = (
                     scores_mat_a
-                    if (
-                        scores_mat_a is not None
-                        and (scores_mat_b is None or cnt_a >= cnt_b)
-                    )
+                    if (scores_mat_a is not None and (scores_mat_b is None or cnt_a >= cnt_b))
                     else scores_mat_b
                 )
 
                 if scores_mat is None or scores_mat.shape[1] <= class_id:
-                    annotated = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-                    return (
-                        annotated,
-                        0,
-                        "Model scores not found or class_id out of range.",
-                        None,
-                    )
+                    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), 0, "Model scores not found.", None
 
                 scores = scores_mat[:, class_id]
 
@@ -679,17 +892,16 @@ class RebarBundleDetector:
                     boxes[:, [0, 2]] *= float(in_w)
                     boxes[:, [1, 3]] *= float(in_h)
 
-                b_xyxy_from_xywh = self.xywh2xyxy(boxes)
+                b_xyxy_from_xywh = self.xywh2xyxy(boxes.copy())
                 valid1 = (
-                    (b_xyxy_from_xywh[:, 2] > b_xyxy_from_xywh[:, 0])
-                    & (b_xyxy_from_xywh[:, 3] > b_xyxy_from_xywh[:, 1])
+                    (b_xyxy_from_xywh[:, 2] > b_xyxy_from_xywh[:, 0]) &
+                    (b_xyxy_from_xywh[:, 3] > b_xyxy_from_xywh[:, 1])
                 ).sum()
                 b_xyxy_as_is = boxes.copy()
                 valid2 = (
-                    (b_xyxy_as_is[:, 2] > b_xyxy_as_is[:, 0])
-                    & (b_xyxy_as_is[:, 3] > b_xyxy_as_is[:, 1])
+                    (b_xyxy_as_is[:, 2] > b_xyxy_as_is[:, 0]) &
+                    (b_xyxy_as_is[:, 3] > b_xyxy_as_is[:, 1])
                 ).sum()
-
                 b_xyxy = b_xyxy_from_xywh if valid1 >= valid2 else b_xyxy_as_is
 
                 keep_mask = scores >= float(conf)
@@ -715,23 +927,45 @@ class RebarBundleDetector:
                         b_xyxy = b_xyxy[keep]
                         dets_xyxy = b_xyxy.tolist()
 
-            bundle_info = None
+            # ------------------------
+            # Build annotation + bundle info
+            # ------------------------
             if dets_xyxy:
-                boxes_array = np.array(dets_xyxy)
+                boxes_array = np.array(dets_xyxy, dtype=np.float32)
+
+                annotated = image_bgr.copy()
+
+                # Overlay instance-colored masks (already hard-clipped to bbox)
+                if seg_masks and instance_colors:
+                    annotated = self._overlay_instance_masks(
+                        annotated,
+                        seg_masks,
+                        instance_colors,
+                        alpha=float(self.seg_mask_alpha),
+                        draw_contours=bool(self.draw_mask_contours),
+                        contour_thickness=int(self.mask_contour_thickness),
+                    )
+
                 bundle_info = self.detect_bundles(boxes_array)
+
+                # Box colors match instance mask colors
+                box_colors = instance_colors if instance_colors and len(instance_colors) == len(boxes_array) else None
+
                 annotated, sorted_boxes = self.draw_centered_ids_with_bundles(
-                    image_bgr, boxes_array, bundle_info
+                    annotated, boxes_array, bundle_info, box_colors=box_colors
                 )
-                count = len(sorted_boxes)
+                count = int(len(sorted_boxes))
             else:
                 annotated = image_bgr.copy()
+                bundle_info = None
                 count = 0
 
+            # HD output with banner
             hd = self.to_hd_1080p(annotated, background=(18, 24, 31))
             banner_height = 100
             img_h, img_w, _ = hd.shape
 
-            if bundle_info and bundle_info["total_bundles"] > 0:
+            if bundle_info and bundle_info.get("total_bundles", 0) > 0:
                 heading = (
                     f"Rebars: {count} | Bundles: {bundle_info['total_bundles']} | "
                     f"In Bundles: {bundle_info['total_rebars_in_bundles']} | "
@@ -755,29 +989,24 @@ class RebarBundleDetector:
             )
 
             return cv2.cvtColor(hd, cv2.COLOR_BGR2RGB), count, None, bundle_info
+
         except Exception as e:
-            return (
-                cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB),
-                0,
-                f"Detection error: {e}",
-                None,
-            )
+            try:
+                fallback = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            except Exception:
+                fallback = None
+            return fallback, 0, f"Detection error: {e}", None
 
     # ------------------------------------------------------------------
     # FastAPI-oriented service methods (JSON responses)
     # ------------------------------------------------------------------
     def detect_image(self, file) -> Dict[str, Any]:
-        """
-        High-level API for FastAPI: detect on an uploaded image (bytes/file-like).
-        """
         if hasattr(file, "read"):
             content = file.read()
         elif isinstance(file, (bytes, bytearray)):
             content = file
         else:
-            raise ValueError(
-                "Unsupported file type for detect_image; expected bytes or file-like object."
-            )
+            raise ValueError("Unsupported file type for detect_image; expected bytes or file-like object.")
 
         nparr = np.frombuffer(content, np.uint8)
         image_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -790,9 +1019,7 @@ class RebarBundleDetector:
                 "image": None,
             }
 
-        annotated_rgb, count, error, bundle_info = self.detect_rebars(
-            image_bgr, model
-        )
+        annotated_rgb, count, error, bundle_info = self.detect_rebars(image_bgr, model)
         image_data = img_to_data_uri(annotated_rgb) if annotated_rgb is not None else None
 
         return {
@@ -803,12 +1030,7 @@ class RebarBundleDetector:
         }
 
     def detect_oak_camera(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
-        """
-        High-level API for FastAPI: detect on a frame from an OAK-D camera.
-        """
-        annotated_rgb, count, error, bundle_info = self.detect_rebars(
-            frame_bgr, model
-        )
+        annotated_rgb, count, error, bundle_info = self.detect_rebars(frame_bgr, model)
         image_data = img_to_data_uri(annotated_rgb) if annotated_rgb is not None else None
 
         return {
@@ -818,7 +1040,10 @@ class RebarBundleDetector:
             "image": image_data,
         }
 
+
+# ------------------------------------------------------------------
 # Model loading (ONNX Runtime)
+# ------------------------------------------------------------------
 def _parse_in_hw(onnx_input_shape, default_hw=(640, 640)):
     def _to_int(v, default):
         try:
@@ -833,13 +1058,13 @@ def _parse_in_hw(onnx_input_shape, default_hw=(640, 640)):
         return (H, W)
     return default_hw
 
+
 def _validate_model_path(model_path: str):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"ONNX model not found at: {model_path}")
     if not model_path.lower().endswith(".onnx"):
-        raise ValueError(
-            f"Expected a .onnx file, got: {os.path.splitext(model_path)[1]}"
-        )
+        raise ValueError(f"Expected a .onnx file, got: {os.path.splitext(model_path)[1]}")
+
 
 def _create_session(model_path: str):
     _validate_model_path(model_path)
@@ -847,6 +1072,7 @@ def _create_session(model_path: str):
     so.intra_op_num_threads = 2
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     providers = ["CPUExecutionProvider"]
+
     try:
         sess = ort.InferenceSession(model_path, sess_options=so, providers=providers)
     except Exception as e:
@@ -856,24 +1082,31 @@ def _create_session(model_path: str):
     in_hw = _parse_in_hw(sess.get_inputs()[0].shape, default_hw=(640, 640))
     return {"sess": sess, "in_name": in_name, "in_hw": in_hw, "path": model_path}
 
+
 def load_model():
     return _create_session(MODEL_PATH)
 
+
 model = load_model()
 
-# Detection record helpers (DB) – PostgreSQL-style placeholders
+
+# ------------------------------------------------------------------
+# Detection record helpers (DB)
+# ------------------------------------------------------------------
 def save_image_files(image_rgb: np.ndarray, det_id: str):
     img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     img_path = os.path.join(DET_DIR, f"{det_id}.jpg")
     thumb_path = os.path.join(THUMB_DIR, f"{det_id}.jpg")
 
     cv2.imwrite(img_path, img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+
     h, w = img_bgr.shape[:2]
     tw = 360
-    th = int(h * (tw / w))
-    thumb = cv2.resize(img_bgr, (tw, th), interpolation=cv2.INTER_AREA)
+    th = int(h * (tw / w)) if w else h
+    thumb = cv2.resize(img_bgr, (tw, max(1, th)), interpolation=cv2.INTER_AREA)
     cv2.imwrite(thumb_path, thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     return img_path, thumb_path
+
 
 def record_detection(
     user_id: int,
@@ -892,11 +1125,12 @@ def record_detection(
     bundle_json = None
     if bundle_info:
         import json
+
         bundle_json = json.dumps(
             {
-                "total_bundles": bundle_info["total_bundles"],
-                "rebars_in_bundles": bundle_info["total_rebars_in_bundles"],
-                "isolated": bundle_info["total_isolated"],
+                "total_bundles": bundle_info.get("total_bundles", 0),
+                "rebars_in_bundles": bundle_info.get("total_rebars_in_bundles", 0),
+                "isolated": bundle_info.get("total_isolated", 0),
             }
         )
 
@@ -916,9 +1150,9 @@ def record_detection(
             snapshot_url,
             img_path,
             thumb_path,
-            count,
-            w,
-            h,
+            int(count),
+            int(w),
+            int(h),
             bundle_json,
         ),
     )
@@ -926,12 +1160,14 @@ def record_detection(
     conn.close()
     return det_id
 
+
 def list_detections(user_id: int, page: int, per_page: int):
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("SELECT COUNT(*) AS c FROM detections WHERE user_id=%s", (user_id,))
     total = cur.fetchone()["c"]
+
     offset = (page - 1) * per_page
     cur.execute(
         """
@@ -945,6 +1181,7 @@ def list_detections(user_id: int, page: int, per_page: int):
     rows = cur.fetchall()
     conn.close()
     return rows, total
+
 
 def get_detection(det_id: str, user_id: int):
     conn = get_conn()
@@ -964,6 +1201,7 @@ def get_detection(det_id: str, user_id: int):
             pass
     return row
 
+
 def delete_detection(det_id: str, user_id: int):
     row = get_detection(det_id, user_id)
     if not row:
@@ -979,29 +1217,34 @@ def delete_detection(det_id: str, user_id: int):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM detections WHERE id=%s AND user_id=%s",
-        (det_id, user_id),
-    )
+    cur.execute("DELETE FROM detections WHERE id=%s AND user_id=%s", (det_id, user_id))
     conn.commit()
     conn.close()
     return True
 
+
+# ------------------------------------------------------------------
 # Image → data URI helpers
+# ------------------------------------------------------------------
 def img_to_data_uri(
     image_rgb: np.ndarray, quality: int = 90, max_w: Optional[int] = None
 ) -> Optional[str]:
+    if image_rgb is None or getattr(image_rgb, "size", 0) == 0:
+        return None
+
     bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     if max_w is not None:
         h, w = bgr.shape[:2]
         if w > max_w:
             new_h = int(h * (max_w / w))
             bgr = cv2.resize(bgr, (max_w, new_h), interpolation=cv2.INTER_AREA)
+
     ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         return None
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
     return f"data:image/jpeg;base64,{b64}"
+
 
 def file_to_data_uri(path: str, max_w: int = 120, quality: int = 85) -> Optional[str]:
     if not os.path.exists(path):
