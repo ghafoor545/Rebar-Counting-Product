@@ -24,7 +24,9 @@ openpyxl>=3.1.0
 
 # Utilities
 python-dotenv>=1.0.0                # for .env file loading
-numpy>=1.26.0                       # required by many above packages
+numpy<2
+hdbscan
+scikit-learn                      # required by many above packages
 
 # Optional / if you have any PyTorch fallback or hybrid code
 # torch>=2.4.0

@@ -5,7 +5,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 # core/config.py -> core -> backend -> Rebar-Counting
 
 # ONNX model path: now points to backend/models/yolo11s.onnx
-MODEL_PATH = os.path.join(BASE_DIR, "backend", "models", "yolo11s.onnx")
+MODEL_PATH = os.path.join(BASE_DIR, "backend", "models", "yolo_seg.onnx")
 
 APP_SECRET = "change-this-secret"
 
