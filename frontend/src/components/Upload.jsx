@@ -49,38 +49,107 @@ function Upload({ user, onSuccess }) {
     }
   };
 
+  const computeUploadSummary = (result) => {
+    const bundleInfo = result?.bundle_info || {};
+    const bundles = Array.isArray(bundleInfo.bundles) ? bundleInfo.bundles : [];
+
+    const validBundles = bundles
+      .filter((b) => b && b.bundle_id != null)
+      .sort((a, b) => {
+        const da = typeof a.distance_m === "number" ? a.distance_m : Number.MAX_VALUE;
+        const db = typeof b.distance_m === "number" ? b.distance_m : Number.MAX_VALUE;
+        return da - db;
+      });
+
+    const distanceAware = validBundles.filter((b) => typeof b.distance_m === "number");
+
+    let maxDiff = 0;
+    for (let i = 0; i < distanceAware.length - 1; i++) {
+      const diff = Math.abs(distanceAware[i].distance_m - distanceAware[i + 1].distance_m);
+      if (diff > maxDiff) maxDiff = diff;
+    }
+
+    let mode;
+    if (validBundles.length <= 1) {
+      mode = "nearest_only";
+    } else if (distanceAware.length >= 2) {
+      mode = maxDiff > 0.2 ? "nearest_only" : "all_bundles_separately";
+    } else {
+      mode = "all_bundles_separately";
+    }
+
+    const countedBundles =
+      mode === "nearest_only" && validBundles.length > 0
+        ? [validBundles[0]]
+        : validBundles;
+
+    const bundleText = countedBundles.length > 0
+      ? countedBundles
+          .map((b, idx) => {
+            const count = b.size ?? (Array.isArray(b.rebars) ? b.rebars.length : 0);
+            return `B${idx + 1} = ${count} bars`;
+          })
+          .join(" | ")
+      : "";
+
+    return {
+      total_rebars: result?.count ?? 0,
+      total_bundles: validBundles.length,
+      max_distance_difference: Number(maxDiff.toFixed(2)),
+      counting_mode: mode,
+      countedBundles,
+      bundleText,
+    };
+  };
+
   const renderMessage = () => {
     if (!result) return null;
     if (result.error) {
       return <div className="alert error">{result.error}</div>;
     }
 
-    const bi = result.bundle_info || {};
+    const summary = computeUploadSummary(result);
+    const modeMessage =
+      summary.counting_mode === "nearest_only"
+        ? "🔍 Mode: Nearest Only"
+        : "📊 Mode: All Bundles";
+    const distanceMessage =
+      summary.total_bundles <= 1
+        ? "Only one bundle detected."
+        : summary.max_distance_difference > 0.2
+        ? `Distance difference (${summary.max_distance_difference.toFixed(2)}m) > 0.20m → Counted only nearest bundle`
+        : `All distance differences ≤ 0.20m → Counted all bundles separately`;
 
-    // ✅ Support both keys:
-    // - total_bundles / total_rebars_in_bundles / total_isolated (live bundle_info)
-    // - rebars_in_bundles / isolated (DB-minified JSON)
-    const bundles = bi.total_bundles ?? 0;
-    const inBundles =
-      bi.rebars_in_bundles ??
-      bi.total_rebars_in_bundles ??
-      0;
-    const isolated =
-      bi.total_isolated ??
-      bi.isolated ??
-      0;
-
-    if (bundles > 0) {
-      return (
-        <div className="alert success">
-          Count: {inBundles} | Bundles: {bundles} | Isolated: {isolated}
-        </div>
-      );
-    }
+    const bundleListMessage = summary.bundleText
+      ? `Counted Bundles: ${summary.bundleText}`
+      : "No bundles counted.";
 
     return (
       <div className="alert success">
-        Count: 0 | Isolated: {isolated}
+        <div className="result-header">
+          <div className="result-count">🎯 Total: {summary.total_rebars} rebars</div>
+          <div className="result-bundles">📦 Bundles: {summary.total_bundles}</div>
+          <div className="result-mode">{modeMessage}</div>
+        </div>
+
+        <div className="mode-reason">{distanceMessage}</div>
+        <div className="bundle-summary"><strong>📋 {bundleListMessage}</strong></div>
+
+        {summary.countedBundles && summary.countedBundles.length > 0 && (
+          <div className="bundle-details">
+            <h5>📊 BUNDLE DETAILS</h5>
+            <ul>
+              {summary.countedBundles.map((b, idx) => {
+                const count = b.size ?? (Array.isArray(b.rebars) ? b.rebars.length : 0);
+                return (
+                  <li key={`${b.bundle_id || idx}-${idx}`}>
+                    B{idx + 1} (bundle {b.bundle_id ?? "?"}): {count} bars
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
       </div>
     );
   };

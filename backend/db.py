@@ -1,6 +1,7 @@
 # backend/db.py
 
 import os
+import sqlite3
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
@@ -11,37 +12,104 @@ load_dotenv()
 
 def get_conn():
     """
-    Open a new PostgreSQL connection.
+    Open a database connection.
 
-    Connection parameters are taken from environment variables:
+    Supports two modes, configured with DB_DRIVER:
 
-        PGHOST      (default: "localhost")
-        PGPORT      (default: "5432")
-        PGDATABASE  (default: "rebar_db")
-        PGUSER      (default: "rebar_user")
-        PGPASSWORD  (default: "")
+      DB_DRIVER=postgres (default): requires PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD
+      DB_DRIVER=sqlite: local sqlite file (DB_PATH or data/app.db)
 
-    Returns a connection where cursor() yields RealDictCursor,
-    so rows behave like dicts: row["column_name"].
+    PostgreSQL returns psycopg2 connection with RealDictCursor (dict rows).
+    SQLite returns an adapter that accepts %s parameter style (for compatibility).
     """
+    db_driver = os.getenv("DB_DRIVER", "postgres").strip().lower()
+
+    if db_driver == "sqlite":
+        db_path = os.getenv("DB_PATH", "data/app.db")
+        db_path = os.path.abspath(db_path)
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        sqlite_conn = sqlite3.connect(db_path, check_same_thread=False)
+        sqlite_conn.row_factory = sqlite3.Row
+        return SQLiteConnectionAdapter(sqlite_conn)
+
     host = os.getenv("PGHOST", "localhost")
     port = int(os.getenv("PGPORT", "5432"))
     dbname = os.getenv("PGDATABASE", "rebar_db")
     user = os.getenv("PGUSER", "rebar_user")
     password = os.getenv("PGPASSWORD", "")
 
-    # Optional: Add debug print to verify variables are loaded
-    # print(f"Connecting to {host}:{port}/{dbname} as {user}")
+    if password == "":
+        raise RuntimeError(
+            "PostgreSQL password is missing. Set PGPASSWORD in .env "
+            "or set DB_DRIVER=sqlite for local development."
+        )
 
-    conn = psycopg2.connect(
-        host=host,
-        port=port,
-        dbname=dbname,
-        user=user,
-        password=password,
-        cursor_factory=RealDictCursor,
-    )
-    return conn
+    try:
+        conn = psycopg2.connect(
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=password,
+            cursor_factory=RealDictCursor,
+        )
+        return conn
+    except psycopg2.OperationalError as e:
+        raise RuntimeError(
+            "Failed to connect to PostgreSQL.\n"
+            f"  Server : {host}:{port}\n"
+            f"  DB     : {dbname}\n"
+            f"  User   : {user}\n"
+            "  Please verify PGPASSWORD and existing DB/user (or switch DB_DRIVER=sqlite).\n"
+            f"Original error: {e}"
+        ) from e
+
+
+class SQLiteCursorAdapter:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, query, params=None):
+        q = query.replace("%s", "?")
+        return self._cursor.execute(q, params or ())
+
+    def executemany(self, query, seq_of_params):
+        q = query.replace("%s", "?")
+        return self._cursor.executemany(q, seq_of_params)
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class SQLiteConnectionAdapter:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return SQLiteCursorAdapter(self._conn.cursor())
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 
 def init_db():
@@ -57,11 +125,19 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
+    db_driver = os.getenv("DB_DRIVER", "postgres").strip().lower()
+    if db_driver == "sqlite":
+        users_id_column = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        index_sql = "CREATE INDEX IF NOT EXISTS idx_det_user_time ON detections(user_id, timestamp)"
+    else:
+        users_id_column = "SERIAL PRIMARY KEY"
+        index_sql = "CREATE INDEX IF NOT EXISTS idx_det_user_time ON detections(user_id, timestamp DESC)"
+
     # Users table
     cur.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
+            id {users_id_column},
             username TEXT UNIQUE,
             email TEXT UNIQUE,
             pwd_hash TEXT NOT NULL,
@@ -92,20 +168,21 @@ def init_db():
         """
     )
 
-    # Index on (user_id, timestamp DESC), same as before
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS idx_det_user_time "
-        "ON detections(user_id, timestamp DESC)"
-    )
+    # Index on (user_id, timestamp) for sqlite, DESC allowed in postgres.
+    cur.execute(index_sql)
 
     # For existing DBs that might not yet have bundle_info:
     # (CREATE TABLE above already includes it for fresh DBs)
-    cur.execute(
-        """
-        ALTER TABLE detections
-        ADD COLUMN IF NOT EXISTS bundle_info TEXT
-        """
-    )
+    try:
+        cur.execute(
+            """
+            ALTER TABLE detections
+            ADD COLUMN IF NOT EXISTS bundle_info TEXT
+            """
+        )
+    except Exception:
+        # Some sqlite versions may not support ADD COLUMN IF NOT EXISTS; okay to skip.
+        pass
 
     conn.commit()
     conn.close()

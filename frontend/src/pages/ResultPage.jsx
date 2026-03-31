@@ -15,10 +15,9 @@ export default function ResultPage({ user }) {
   const [viewImage, setViewImage] = useState(null);
   const [viewMeta, setViewMeta] = useState(null);
 
-  const userId = user?.id;
+  const userId = user?.id || 1;
 
   useEffect(() => {
-    if (!userId) return;
     fetchPage(page);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId, page]);

@@ -62,7 +62,31 @@ Rebar Counting Product/
 - Node.js 18+ & npm
 - PostgreSQL 15+ (running locally)
 - (Optional) OAK camera (OAK-D / OAK-1 etc.) + DepthAI drivers
-- 
+
+### Environment configuration
+
+Create a `.env` file in project root. Two database modes are supported:
+
+- PostgreSQL (default):
+  - `DB_DRIVER=postgres`
+  - `PGHOST=localhost`
+  - `PGPORT=5432`
+  - `PGDATABASE=rebar_db`
+  - `PGUSER=rebar_user`
+  - `PGPASSWORD=<your_password>`
+
+- SQLite (local development, no PostgreSQL required):
+  - `DB_DRIVER=sqlite`
+  - `DB_PATH=data/app.db`
+
+If using PostgreSQL, ensure the DB+user exist:
+
+```sql
+CREATE ROLE rebar_user WITH LOGIN PASSWORD '<your_password>';
+CREATE DATABASE rebar_db OWNER rebar_user;
+GRANT ALL PRIVILEGES ON DATABASE rebar_db TO rebar_user;
+```
+
 ### Virtual Environment Setup
 
 **Windows**  

@@ -515,61 +515,83 @@ class RebarBundleDetector:
         bundles = bundle_info.get("bundles", [])
         id_mapping = bundle_info.get("id_mapping", {})
         
-        # Get all rebar indices from counted bundles only
-        counted_rebar_indices = set()
+# Annotate counted rebars with bundle-specific 1..N IDs for each bundle (_within bundle_ number reset),
+        # sorted top-to-bottom (by center y), then left-to-right (by center x).
         for bundle in bundles:
-            if bundle.get("bundle_id") in counted_bundle_ids:
-                for rebar in bundle.get("rebars", []):
-                    counted_rebar_indices.add(rebar["global_index"])
-        
-        # Annotate only counted rebars with their unique IDs (bundle-specific)
-        for global_idx, id_info in id_mapping.items():
-            if global_idx in counted_rebar_indices and global_idx < len(boxes):
-                box = boxes[global_idx]
+            bundle_id = bundle.get("bundle_id")
+            if bundle_id not in counted_bundle_ids:
+                continue
+
+            rebars = bundle.get("rebars", []) or []
+            if not rebars:
+                continue
+
+            sorted_rebars = sorted(
+                rebars,
+                key=lambda r: (
+                    ((r.get("box", [0, 0, 0, 0])[1] + r.get("box", [0, 0, 0, 0])[3]) / 2.0),
+                    ((r.get("box", [0, 0, 0, 0])[0] + r.get("box", [0, 0, 0, 0])[2]) / 2.0),
+                ),
+            )
+
+            for idx, rebar in enumerate(sorted_rebars, start=1):
+                box = rebar.get("box")
+                if not box or len(box) < 4:
+                    continue
+
                 x1, y1, x2, y2 = map(int, box[:4])
-                display_id = str(id_info["display_id"])
-                
-                # Calculate center of the rebar
                 cx = int((x1 + x2) / 2)
                 cy = int((y1 + y2) / 2)
-                
-                # Draw the unique ID centered in the rebar
+
+                display_txt = str(idx)
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                
-                # Adjust font size based on rebar size
-                box_size = min(x2 - x1, y2 - y1)
-                if box_size < 25:
-                    font_scale, thickness = 0.4, 1
-                elif box_size < 40:
-                    font_scale, thickness = 0.5, 1
-                elif box_size < 70:
-                    font_scale, thickness = 0.6, 2
-                elif box_size < 120:
-                    font_scale, thickness = 0.7, 2
-                else:
-                    font_scale, thickness = 0.8, 2
-                
-                # Get text size
-                (text_w, text_h), _ = cv2.getTextSize(display_id, font, font_scale, thickness)
-                
-                # Position text centered in the rebar
+
+                box_size = max(1, min(abs(x2 - x1), abs(y2 - y1)))
+
+                # Use smaller font for small rebars to reduce clutter, always centered.
+                font_scale = max(0.16, min(0.4, box_size / 140.0))
+                thickness = 1
+
+                (text_w, text_h), _ = cv2.getTextSize(display_txt, font, font_scale, thickness)
+
+                # If the text is too big for the rebar, scale it down.
+                if text_w > box_size * 0.8 or text_h > box_size * 0.8:
+                    scale_factor = min(box_size * 0.8 / text_w, box_size * 0.8 / text_h)
+                    font_scale *= scale_factor
+                    font_scale = max(0.14, font_scale)
+                    (text_w, text_h), _ = cv2.getTextSize(display_txt, font, font_scale, thickness)
+
                 text_x = cx - text_w // 2
                 text_y = cy + text_h // 2
-                
-                # Draw background rectangle for text
-                padding = 4
-                cv2.rectangle(
-                    img,
-                    (text_x - padding, text_y - text_h - padding),
-                    (text_x + text_w + padding, text_y + padding),
-                    (0, 0, 0),
-                    -1
-                )
-                
-                # Draw the ID text
+
+                padding = max(2, int(text_h * 0.2))
+                rect_x1 = text_x - padding
+                rect_y1 = text_y - text_h - padding
+                rect_x2 = text_x + text_w + padding
+                rect_y2 = text_y + padding
+
+                # Keep label inside image boundaries
+                h, w = img.shape[:2]
+                rect_x1 = max(0, min(rect_x1, w - 1))
+                rect_x2 = max(0, min(rect_x2, w - 1))
+                rect_y1 = max(0, min(rect_y1, h - 1))
+                rect_y2 = max(0, min(rect_y2, h - 1))
+
+                # Draw a soft shadowed text only (no heavy rectangle/marker) for readability
                 cv2.putText(
                     img,
-                    display_id,
+                    display_txt,
+                    (text_x, text_y),
+                    font,
+                    font_scale,
+                    (0, 0, 0),
+                    thickness + 2,
+                    cv2.LINE_AA,
+                )
+
+                cv2.putText(
+                    img,
+                    display_txt,
                     (text_x, text_y),
                     font,
                     font_scale,
@@ -577,7 +599,7 @@ class RebarBundleDetector:
                     thickness,
                     cv2.LINE_AA,
                 )
-        
+
         return img
 
     def fetch_snapshot(self, url: str):

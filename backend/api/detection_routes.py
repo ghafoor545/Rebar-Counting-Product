@@ -444,6 +444,22 @@ async def detect_uploaded_image(
     source_label = stream_url if stream_url else "Upload"
     filename = file.filename or "Uploaded Image"
 
+    # Apply bundle numbering labels (overlay for upload results)
+    if bundle_info and isinstance(bundle_info.get("bundles"), list):
+        try:
+            # convert to BGR for drawing in place
+            bgr_image = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
+            counted_bundle_ids = {b.get("bundle_id") for b in bundle_info.get("bundles", []) if b.get("bundle_id") is not None}
+            bgr_labeled = detector_service.annotate_counted_bundles(
+                bgr_image,
+                None,
+                bundle_info,
+                counted_bundle_ids,
+            )
+            annotated_rgb = cv2.cvtColor(bgr_labeled, cv2.COLOR_BGR2RGB)
+        except Exception:
+            pass
+
     det_id = record_detection(
         user_id=user_id,
         processed_rgb=annotated_rgb,

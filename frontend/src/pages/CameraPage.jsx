@@ -11,12 +11,13 @@ function CameraPage({ user }) {
   const [busyCapture, setBusyCapture] = useState(false);
   const [galleryItems, setGalleryItems] = useState([]);
 
+  const userId = user?.id || 1;
+
   // Fetch recent detections for gallery
   const fetchRecent = async () => {
-    if (!user || !user.id) return;
     try {
       const url = new URL(`${API_BASE_URL}/detections/recent`);
-      url.searchParams.set("user_id", user.id);
+      url.searchParams.set("user_id", userId);
       url.searchParams.set("limit", "10");
       url.searchParams.set("source", "OAK-D Pro");
       const res = await fetch(url.toString());
@@ -36,11 +37,10 @@ function CameraPage({ user }) {
   const handleStopLive = () => setStreaming(false);
 
   const handleCaptureAndCount = async () => {
-    if (!user || !user.id) return;
     setBusyCapture(true);
     try {
       const formData = new FormData();
-      formData.append("user_id", String(user.id));
+      formData.append("user_id", String(userId));
 
       const res = await fetch(`${API_BASE_URL}/capture-and-count`, {
         method: "POST",
@@ -103,15 +103,26 @@ function CameraPage({ user }) {
       <div className="bundle-breakdown">
         <h5>📊 BUNDLE DETAILS</h5>
         <div className="bundle-list">
-          {bundleInfo.bundles_counted.map((bundle, idx) => (
-            <div key={bundle.bundle_id} className="bundle-item">
-              <div className="bundle-dot" style={{ backgroundColor: bundleColors[idx % bundleColors.length] }}></div>
-              <div className="bundle-name">Bundle {bundle.bundle_id}</div>
-              <div className="bundle-size">{bundle.rebar_count} rebars</div>
-              <div className="bundle-depth">📏 {bundle.distance_m?.toFixed(2)}m</div>
-              <div className="bundle-status">✓ COUNTED</div>
+          {bundleInfo.bundles_counted.map((bundle, idx) => {
+            const counted = !!bundle.counted;
+            const statusText = counted ? "✓ COUNTED" : "⛔ IGNORED";
+            const statusClass = counted ? "bundle-status counted" : "bundle-status ignored";
+            const label = bundle.bundle_label || `B${idx + 1}`;
+
+            return (
+              <div key={`${bundle.bundle_id}-${idx}`} className="bundle-item">
+                <div className="bundle-dot" style={{ backgroundColor: bundleColors[idx % bundleColors.length] }}></div>
+                <div className="bundle-name">{label}</div>
+                <div className="bundle-size">{bundle.rebar_count} rebars</div>
+                <div className="bundle-depth">
+              📏 {bundle.distance_m != null && !Number.isNaN(bundle.distance_m)
+                ? `${bundle.distance_m.toFixed(2)}m`
+                : "unknown"}
             </div>
-          ))}
+                <div className={statusClass}>{statusText}</div>
+              </div>
+            );
+          })}
         </div>
         
         <div className="total-rebars">
@@ -133,10 +144,11 @@ function CameraPage({ user }) {
     const countingMode = captureResult.counting_mode || (totalBundles > 0 ? (totalBundles === 1 ? "nearest_only" : "all_bundles_separately") : "none");
     const maxDiff = captureResult.max_distance_difference || 0;
     
-    // Create display text for bundles
+    // Create display text for bundles (only counted ones)
     let bundleDisplayText = "";
     if (bundleInfo && bundleInfo.bundles_counted) {
-      bundleDisplayText = bundleInfo.bundles_counted.map(b => `Bundle ${b.bundle_id} = ${b.rebar_count} bars`).join(" | ");
+      const countedBundles = bundleInfo.bundles_counted.filter((b) => b.counted);
+      bundleDisplayText = countedBundles.map((b) => `Bundle ${b.bundle_id} = ${b.rebar_count} bars`).join(" | ");
     }
     
     return (

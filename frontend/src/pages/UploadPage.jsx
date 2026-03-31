@@ -7,13 +7,13 @@ const API_BASE_URL =
 
 function UploadPage({ user }) {
   const [galleryItems, setGalleryItems] = useState([]);
+  const userId = user?.id || 1;
 
   // Fetch recent gallery (limit 10)
   const fetchRecent = async () => {
-    if (!user || !user.id) return;
     try {
       const url = new URL(`${API_BASE_URL}/detections/recent`);
-      url.searchParams.set("user_id", user.id);
+      url.searchParams.set("user_id", userId);
       url.searchParams.set("limit", "10");
       const res = await fetch(url.toString());
       if (!res.ok) return;
@@ -61,6 +61,49 @@ function UploadPage({ user }) {
       isolated: Number(isolated) || 0,
     };
   };
+
+  const computeUploadSummary = (result) => {
+    const bundleInfo = result?.bundle_info || {};
+    const bundles = Array.isArray(bundleInfo.bundles) ? bundleInfo.bundles : [];
+
+    const validBundles = bundles
+      .filter((b) => b && typeof b.distance_m === "number")
+      .sort((a, b) => a.distance_m - b.distance_m);
+
+    let maxDiff = 0;
+    for (let i = 0; i < validBundles.length - 1; i++) {
+      const diff = Math.abs(validBundles[i].distance_m - validBundles[i + 1].distance_m);
+      if (diff > maxDiff) maxDiff = diff;
+    }
+
+    const mode = validBundles.length <= 1
+      ? "nearest_only"
+      : maxDiff > 0.2
+      ? "nearest_only"
+      : "all_bundles_separately";
+
+    const countedBundles =
+      mode === "nearest_only" && validBundles.length > 0
+        ? [validBundles[0]]
+        : validBundles;
+
+    const bundleText = countedBundles
+      .map((b, idx) => {
+        const count = b.size ?? (Array.isArray(b.rebars) ? b.rebars.length : 0);
+        return `B${idx + 1} = ${count} bars`;
+      })
+      .join(" | ");
+
+    return {
+      total_rebars: result?.count ?? 0,
+      total_bundles: validBundles.length,
+      max_distance_difference: Number(maxDiff.toFixed(2)),
+      counting_mode: mode,
+      countedBundles,
+      bundleText,
+    };
+  };
+
 
   return (
     <div className="page-wrap">
