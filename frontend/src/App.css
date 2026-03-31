@@ -1,4 +1,3 @@
-
 /* App.css */
 @import url("https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap");
 
@@ -35,7 +34,7 @@ body {
     radial-gradient(1200px 600px at 90% -10%, #231548 0%, transparent 70%),
     linear-gradient(180deg, var(--bg1) 0%, var(--bg2) 100%);
   color: var(--text);
-  font-weight: 400; /* Normal weight */
+  font-weight: 400;
 }
 
 .app-root {
@@ -143,7 +142,7 @@ select:focus {
 .hero-title {
   margin: 0;
   font-size: 2rem;
-  font-weight: 700; /* Bold only for title */
+  font-weight: 700;
 }
 
 /* Navbar */
@@ -160,7 +159,7 @@ select:focus {
 .btn {
   background: linear-gradient(135deg, var(--accent1), var(--accent2));
   color: #0a0f1c;
-  font-weight: 600; /* Semi-bold for buttons */
+  font-weight: 600;
   letter-spacing: 0.3px;
   border: 0;
   border-radius: 12px;
@@ -197,7 +196,7 @@ select:focus {
 .btn.nav-btn {
   padding: 6px 12px;
   font-size: 0.9rem;
-  font-weight: 500; /* Normal weight for nav items */
+  font-weight: 500;
   background: transparent;
   border: 1px solid transparent;
   color: var(--text);
@@ -280,6 +279,7 @@ select:focus {
 .status-row {
   display: flex;
   justify-content: center;
+  gap: 12px;
   margin-top: 10px;
 }
 
@@ -302,6 +302,12 @@ select:focus {
   background: rgba(239, 68, 68, 0.12);
   color: #f87171;
   border-color: rgba(239, 68, 68, 0.35);
+}
+
+.status-chip.depth {
+  background: rgba(16, 185, 129, 0.12);
+  color: #34d399;
+  border-color: rgba(16, 185, 129, 0.35);
 }
 
 /* Live viewer */
@@ -338,9 +344,20 @@ select:focus {
 }
 
 .live-placeholder {
-  padding: 18px;
+  padding: 40px 18px;
   color: #cbd5e1;
   text-align: center;
+}
+
+.placeholder-icon {
+  font-size: 3rem;
+  margin-bottom: 12px;
+}
+
+.placeholder-hint {
+  font-size: 0.8rem;
+  color: #94a3b8;
+  margin-top: 8px;
 }
 
 /* Capture button row under video */
@@ -349,6 +366,18 @@ select:focus {
   margin-top: 12px;
   display: flex;
   justify-content: center;
+}
+
+.capture-btn {
+  font-size: 1.1rem;
+  padding: 12px 28px;
+}
+
+.capture-info-text {
+  text-align: center;
+  margin-top: 12px;
+  font-size: 0.8rem;
+  color: var(--muted);
 }
 
 /* Grid rows */
@@ -397,6 +426,130 @@ select:focus {
   overflow: auto;
 }
 
+/* ========================================
+   Camera Page - Result Card Enhancements
+   ======================================== */
+
+.camera-subtitle {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0 0 12px 0;
+}
+
+.result-card {
+  margin: 10px 0 14px;
+}
+
+.capture-result-info {
+  margin-bottom: 12px;
+}
+
+.result-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+  font-size: 1rem;
+}
+
+.result-count {
+  font-weight: 700;
+  font-size: 1.2rem;
+}
+
+.result-bundles {
+  font-weight: 600;
+}
+
+.result-distance {
+  background: rgba(0, 100, 255, 0.2);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  color: #93c5fd;
+}
+
+.result-mode {
+  margin-top: 8px;
+  font-size: 0.85rem;
+  color: #fbbf24;
+}
+
+.mode-reason {
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+/* Bundle breakdown panel */
+.bundle-breakdown {
+  margin-top: 12px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+}
+
+.bundle-breakdown h5 {
+  margin: 0 0 10px 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.bundle-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bundle-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.bundle-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* Bundle colors - matching backend */
+.bundle-color-0 .bundle-dot { background: #00ff00; } /* Green */
+.bundle-color-1 .bundle-dot { background: #ffa500; } /* Orange */
+.bundle-color-2 .bundle-dot { background: #ff00ff; } /* Magenta */
+.bundle-color-3 .bundle-dot { background: #00ffff; } /* Cyan */
+.bundle-color-4 .bundle-dot { background: #ffff00; } /* Yellow */
+
+.bundle-name {
+  font-weight: 600;
+}
+
+.bundle-size {
+  color: #e2e8f0;
+}
+
+.bundle-depth {
+  background: rgba(0, 100, 255, 0.15);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  color: #93c5fd;
+}
+
+/* Placeholders */
+.no-result-placeholder,
+.no-gallery-placeholder {
+  padding: 24px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 0.9rem;
+}
+
 /* Gallery */
 
 .shot-grid {
@@ -433,10 +586,23 @@ select:focus {
   border-radius: 999px;
 }
 
+.shot-mode-badge {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: rgba(251, 191, 36, 0.9);
+  color: #1f2937;
+  font-weight: 700;
+  font-size: 0.7rem;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
 .shot-footer {
   padding: 10px 12px;
   color: #eaf2ff;
   font-weight: 600;
+  font-size: 0.8rem;
   border-top: 1px solid rgba(255, 255, 255, 0.1);
 }
 
@@ -449,7 +615,6 @@ select:focus {
 
 .table-row {
   display: grid;
-  /* ID, Time, Stream, Snapshot, Count, Bundles, Isolated, Actions */
   grid-template-columns: 1.4fr 1.8fr 1.8fr 2.4fr 0.9fr 0.8fr 0.8fr 1.4fr;
   gap: 4px;
   align-items: center;
@@ -737,4 +902,54 @@ select:focus {
 .auth-logo-img {
   height: 60px;
   width: auto;
+}
+
+/* ========================================
+   Responsive adjustments
+   ======================================== */
+
+@media (max-width: 768px) {
+  .result-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  
+  .bundle-item {
+    flex-wrap: wrap;
+  }
+  
+  .shot-grid {
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  }
+  
+  .table-row {
+    grid-template-columns: 1fr 1fr 1fr;
+    font-size: 0.75rem;
+  }
+  
+  .capture-btn {
+    font-size: 1rem;
+    padding: 10px 20px;
+  }
+}
+
+@media (max-width: 480px) {
+  .grid-row {
+    flex-direction: column;
+  }
+  
+  .grid-col,
+  .grid-col.small {
+    flex: 1 1 100%;
+  }
+  
+  .shot-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .status-row {
+    flex-direction: column;
+    gap: 8px;
+  }
 }

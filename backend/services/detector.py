@@ -1,8 +1,10 @@
 # backend/services/detector.py
+
 import os
 import uuid
 import base64
 from typing import Optional, Tuple, Dict, Any, List
+from collections import defaultdict
 
 import numpy as np
 import cv2
@@ -19,33 +21,13 @@ from backend.utils.utils import utc_now_iso
 # Bundle Detector Class
 # ------------------------------------------------------------------
 class RebarBundleDetector:
-    """
-    Detects bundles of rebars based on proximity clustering.
-
-    Bundle definition: min_bundle_size or more rebars close to each other.
-    Less than min_bundle_size rebars together are considered isolated.
-
-    FIX (bundle counting):
-      DBSCAN can "absorb" border points into a cluster. We prune weakly connected
-      members inside each candidate bundle by requiring min neighbor count.
-
-    Supports segmentation ONNX:
-      output0: [B, no, anchors]  (e.g. [1, 37, 8400])
-      output1: [B, nm, mh, mw]   (e.g. [1, 32, 160, 160])
-
-    Visualization:
-      - Different color mask for each instance
-      - Bounding box colored to match mask
-      - IMPORTANT: masks are HARD-CLIPPED to each bbox in original image space
-        to remove rainbow noise in background.
-    """
 
     def __init__(
         self,
         eps: float = 1.0,
-        min_bundle_size: int = 5,
-        min_samples: int = 4,
-        row_tolerance: float = 10.0,
+        min_bundle_size: int = 3,
+        min_samples: int = 2,
+        row_tolerance: float = 40.0,
         use_adaptive_eps: bool = True,
         min_neighbors_in_bundle: Optional[int] = None,
         # segmentation overlay
@@ -54,8 +36,15 @@ class RebarBundleDetector:
         seg_mask_alpha: float = 0.35,
         draw_mask_contours: bool = True,
         mask_contour_thickness: int = 2,
+        # depth filtering (OAK-D Pro)
+        use_depth_filter: bool = True,
+        max_detection_distance_mm: float = 3000.0,
+        min_detection_distance_mm: float = 200.0,
+        # Bundle distance tracking
+        track_bundle_distances: bool = True,
+        nearest_bundle_only: bool = False,
         # debug
-        debug: bool = False,
+        debug=False,
     ):
         self.eps = eps
         self.min_bundle_size = min_bundle_size
@@ -70,14 +59,125 @@ class RebarBundleDetector:
         self.draw_mask_contours = draw_mask_contours
         self.mask_contour_thickness = mask_contour_thickness
 
+        # Depth filter settings
+        self.use_depth_filter = use_depth_filter
+        self.max_detection_distance_mm = max_detection_distance_mm
+        self.min_detection_distance_mm = min_detection_distance_mm
+
+        # Bundle distance tracking
+        self.track_bundle_distances = track_bundle_distances
+        self.nearest_bundle_only = nearest_bundle_only
+        
         self.debug = debug
+
+    def _make_json_safe(self, obj):
+        """Recursively convert non-JSON-serializable values to None"""
+        if isinstance(obj, dict):
+            return {k: self._make_json_safe(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_json_safe(v) for v in obj]
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            if np.isnan(obj) or np.isinf(obj):
+                return None
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return self._make_json_safe(obj.tolist())
+        elif isinstance(obj, (float, int)):
+            if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
+                return None
+            return obj
+        return obj
+
+    def _calculate_adaptive_eps(self, centers: np.ndarray, sizes: np.ndarray) -> float:
+        """Calculate adaptive eps based on rebar sizes and distances"""
+        if len(centers) < 2:
+            return self.eps
+        
+        avg_size = float(np.mean(sizes))
+        
+        distances = []
+        for i in range(len(centers)):
+            for j in range(i+1, len(centers)):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                distances.append(dist)
+        
+        if distances:
+            median_distance = np.median(distances)
+            dynamic_eps = max(avg_size * 0.5, median_distance * 0.3)
+            dynamic_eps = min(max(dynamic_eps, self.eps * 0.5), self.eps * 2.0)
+            return float(dynamic_eps)
+        
+        return float(self.eps)
+
+    def _calculate_bundle_distance(
+        self, 
+        bundle: Dict[str, Any], 
+        depth_map: np.ndarray,
+        boxes: np.ndarray
+    ) -> Optional[float]:
+        """Calculate median distance for a bundle based on its member rebar distances"""
+        if depth_map is None or not self.track_bundle_distances:
+            return None
+        
+        try:
+            from backend.services.oak_utils import get_depth_at_point
+        except ImportError:
+            return None
+        
+        distances = []
+        
+        for rebar in bundle["rebars"]:
+            box = rebar["box"]
+            x1, y1, x2, y2 = map(int, box[:4])
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            
+            depth_mm = get_depth_at_point(depth_map, cx, cy, sample_radius=5)
+            
+            if depth_mm is not None and depth_mm > 0:
+                distances.append(depth_mm)
+        
+        if distances:
+            bundle_distance = float(np.median(distances))
+            bundle["distance_mm"] = bundle_distance
+            bundle["distance_m"] = round(bundle_distance / 1000.0, 2)
+            
+            if self.debug:
+                print(f"[Bundle {bundle['bundle_id']}] Distance: {bundle_distance:.0f}mm "
+                      f"({bundle_distance/1000:.2f}m) from {len(distances)} rebars")
+            
+            return bundle_distance
+        else:
+            bundle["distance_mm"] = None
+            bundle["distance_m"] = None
+            return None
+
+    # ------------------------------------------------------------------
+    # Sort rebars from top to bottom
+    # ------------------------------------------------------------------
+    def _sort_rebars_top_to_bottom_by_indices(self, indices, centers):
+        """Sort rebars from top to bottom by y-coordinate (smaller y = top)"""
+        if len(indices) <= 1:
+            return indices
+        
+        pairs = list(zip(indices, centers))
+        # Sort by y-coordinate (top to bottom)
+        pairs.sort(key=lambda x: x[1][1])
+        
+        return np.array([idx for idx, _ in pairs])
 
     # ------------------------------------------------------------------
     # Bundle clustering
     # ------------------------------------------------------------------
-    def detect_bundles(self, boxes: np.ndarray) -> Dict[str, Any]:
+    def detect_bundles(
+        self, 
+        boxes: np.ndarray,
+        depth_map: Optional[np.ndarray] = None
+    ) -> Dict[str, Any]:
         if len(boxes) == 0:
-            return {
+            return self._make_json_safe({
                 "bundles": [],
                 "isolated_rebars": [],
                 "total_bundles": 0,
@@ -91,14 +191,17 @@ class RebarBundleDetector:
                     "rebars_in_bundles": 0,
                     "isolated": 0,
                 },
-            }
+                "nearest_bundle": None,
+            })
 
         centers, sizes = self._get_box_centers_and_sizes(boxes)
 
-        eps_to_use = float(self.eps)
-        if self.use_adaptive_eps and len(sizes):
-            avg_size = float(np.mean(sizes))
-            eps_to_use = max(float(self.eps), avg_size * 0.10)
+        if self.use_adaptive_eps:
+            eps_to_use = self._calculate_adaptive_eps(centers, sizes)
+            if self.debug:
+                print(f"[DBSCAN] Dynamic eps: {eps_to_use:.2f}")
+        else:
+            eps_to_use = float(self.eps)
 
         clustering = DBSCAN(eps=eps_to_use, min_samples=int(self.min_samples)).fit(centers)
         labels = clustering.labels_
@@ -117,7 +220,6 @@ class RebarBundleDetector:
         id_mapping: Dict[int, Dict[str, Any]] = {}
         bundle_counter = 0
 
-        # Everything starts unassigned; only accepted bundle members are removed.
         unassigned = set(range(len(boxes)))
 
         min_neighbors = (
@@ -127,7 +229,6 @@ class RebarBundleDetector:
         )
         min_neighbors = max(1, min_neighbors)
 
-        # ---- Process bundles with pruning ----
         for label in bundle_clusters:
             cluster_indices = np.where(labels == label)[0]
             if len(cluster_indices) == 0:
@@ -135,15 +236,13 @@ class RebarBundleDetector:
 
             cluster_centers = centers[cluster_indices]
 
-            # Neighbor counts inside cluster (within eps_to_use)
             diff = cluster_centers[:, None, :] - cluster_centers[None, :, :]
             dist = np.sqrt((diff ** 2).sum(axis=2))
-            neighbor_counts = (dist <= eps_to_use).sum(axis=1) - 1  # exclude self
+            neighbor_counts = (dist <= eps_to_use).sum(axis=1) - 1
 
             keep_local = neighbor_counts >= min_neighbors
             kept_indices = cluster_indices[keep_local]
 
-            # If pruning makes it too small, not a bundle
             if len(kept_indices) < int(self.min_bundle_size):
                 continue
 
@@ -152,24 +251,26 @@ class RebarBundleDetector:
             kept_boxes = boxes[kept_indices]
             cluster_size = int(len(kept_indices))
 
-            sorted_indices = self._sort_rebars_rowwise_left_to_right(
+            # Sort rebars from top to bottom
+            sorted_indices = self._sort_rebars_top_to_bottom_by_indices(
                 kept_indices, kept_centers
             )
 
             bundle_rebars = []
+            # Assign IDs starting from 1 for each bundle (top to bottom)
             for bundle_idx, global_idx in enumerate(sorted_indices, start=1):
                 bundle_rebars.append(
                     {
                         "global_index": int(global_idx),
                         "bundle_index": int(bundle_idx),
-                        "display_id": int(bundle_idx),
+                        "display_id": int(bundle_idx),  # Bundle-specific ID starting at 1
                         "box": boxes[global_idx].tolist(),
                         "center": centers[global_idx].tolist(),
                         "row": self._get_row_number(centers[global_idx], kept_centers),
                     }
                 )
                 id_mapping[int(global_idx)] = {
-                    "display_id": int(bundle_idx),
+                    "display_id": int(bundle_idx),  # This is the ID that gets drawn
                     "bundle_id": int(bundle_counter),
                     "bundle_index": int(bundle_idx),
                     "type": "bundle",
@@ -181,29 +282,35 @@ class RebarBundleDetector:
             all_x2 = kept_boxes[:, 2]
             all_y2 = kept_boxes[:, 3]
 
-            bundles.append(
-                {
-                    "bundle_id": int(bundle_counter),
-                    "size": int(cluster_size),
-                    "rebars": bundle_rebars,
-                    "global_indices": sorted_indices.tolist(),
-                    "bounds": [
-                        float(np.min(all_x1)),
-                        float(np.min(all_y1)),
-                        float(np.max(all_x2)),
-                        float(np.max(all_y2)),
-                    ],
-                }
-            )
+            bundle_dict = {
+                "bundle_id": int(bundle_counter),
+                "size": int(cluster_size),
+                "rebars": bundle_rebars,
+                "global_indices": sorted_indices.tolist(),
+                "bounds": [
+                    float(np.min(all_x1)),
+                    float(np.min(all_y1)),
+                    float(np.max(all_x2)),
+                    float(np.max(all_y2)),
+                ],
+                "distance_mm": None,
+                "distance_m": None,
+                "is_nearest": False,
+                "counted": True,
+            }
+            
+            if depth_map is not None and self.track_bundle_distances:
+                self._calculate_bundle_distance(bundle_dict, depth_map, boxes)
+            
+            bundles.append(bundle_dict)
 
             for gi in kept_indices.tolist():
                 unassigned.discard(int(gi))
 
-        # ---- Isolated = everything not accepted into a bundle ----
         isolated_indices = sorted(list(unassigned))
         if isolated_indices:
             isolated_centers = centers[isolated_indices]
-            sorted_isolated = self._sort_rebars_rowwise_left_to_right(
+            sorted_isolated = self._sort_rebars_top_to_bottom_by_indices(
                 np.array(isolated_indices), isolated_centers
             )
 
@@ -224,51 +331,111 @@ class RebarBundleDetector:
                     "group_size": 1,
                 }
 
-        total_rebars_in_bundles = int(sum(b["size"] for b in bundles))
-        total_isolated = int(len(isolated_rebars))
-
-        return {
+        # Handle nearest bundle only mode
+        nearest_bundle_info = None
+        
+        if self.nearest_bundle_only and bundles:
+            valid_bundles = [b for b in bundles if b.get("distance_mm") is not None]
+            if valid_bundles:
+                nearest_bundle = min(valid_bundles, key=lambda b: b["distance_mm"])
+                
+                for bundle in bundles:
+                    bundle["is_nearest"] = (bundle["bundle_id"] == nearest_bundle["bundle_id"])
+                    bundle["counted"] = (bundle["bundle_id"] == nearest_bundle["bundle_id"])
+                
+                if self.debug:
+                    print(f"[Nearest Bundle Mode] Keeping only bundle {nearest_bundle['bundle_id']}")
+                
+                bundles = [nearest_bundle]
+                
+                nearest_rebar_indices = set(nearest_bundle["global_indices"])
+                
+                new_id_mapping = {}
+                for idx in nearest_rebar_indices:
+                    if idx in id_mapping:
+                        new_id_mapping[idx] = id_mapping[idx]
+                id_mapping = new_id_mapping
+                
+                isolated_indices = [i for i in unassigned if i not in nearest_rebar_indices]
+                isolated_rebars = []
+                for display_idx, global_idx in enumerate(isolated_indices, start=1):
+                    isolated_rebars.append({
+                        "global_index": int(global_idx),
+                        "display_id": int(display_idx),
+                        "box": boxes[global_idx].tolist(),
+                        "center": centers[global_idx].tolist(),
+                        "type": "isolated",
+                        "group_size": 1,
+                    })
+                
+                total_rebars_in_bundles = nearest_bundle["size"]
+                total_isolated = len(isolated_indices)
+                total_bundles = 1
+                
+                nearest_bundle_info = {
+                    "bundle_id": nearest_bundle["bundle_id"],
+                    "distance_mm": nearest_bundle["distance_mm"],
+                    "distance_m": nearest_bundle["distance_m"],
+                    "size": nearest_bundle["size"]
+                }
+                
+                display_summary = {
+                    "total": int(len(boxes)),
+                    "bundles": total_bundles,
+                    "rebars_in_bundles": total_rebars_in_bundles,
+                    "isolated": total_isolated,
+                }
+                
+                result = {
+                    "bundles": bundles,
+                    "isolated_rebars": isolated_rebars,
+                    "total_bundles": total_bundles,
+                    "total_rebars_in_bundles": total_rebars_in_bundles,
+                    "total_isolated": total_isolated,
+                    "total_count": int(len(boxes)),
+                    "id_mapping": id_mapping,
+                    "display_summary": display_summary,
+                    "nearest_bundle": nearest_bundle_info,
+                }
+                return self._make_json_safe(result)
+        
+        # Normal mode - mark all as counted
+        for bundle in bundles:
+            bundle["counted"] = True
+        
+        total_bundles = int(len(bundles))
+        
+        if bundles and self.track_bundle_distances:
+            valid_bundles = [b for b in bundles if b.get("distance_mm") is not None]
+            if valid_bundles:
+                nearest = min(valid_bundles, key=lambda b: b["distance_mm"])
+                nearest_bundle_info = {
+                    "bundle_id": nearest["bundle_id"],
+                    "distance_mm": nearest["distance_mm"],
+                    "distance_m": nearest["distance_m"],
+                    "size": nearest["size"]
+                }
+                for bundle in bundles:
+                    bundle["is_nearest"] = (bundle["bundle_id"] == nearest["bundle_id"])
+        
+        result = {
             "bundles": bundles,
             "isolated_rebars": isolated_rebars,
-            "total_bundles": int(len(bundles)),
-            "total_rebars_in_bundles": total_rebars_in_bundles,
-            "total_isolated": total_isolated,
+            "total_bundles": total_bundles,
+            "total_rebars_in_bundles": 0,
+            "total_isolated": int(len(isolated_rebars)),
             "total_count": int(len(boxes)),
             "id_mapping": id_mapping,
             "display_summary": {
                 "total": int(len(boxes)),
-                "bundles": int(len(bundles)),
-                "rebars_in_bundles": total_rebars_in_bundles,
-                "isolated": total_isolated,
+                "bundles": total_bundles,
+                "rebars_in_bundles": 0,
+                "isolated": int(len(isolated_rebars)),
             },
+            "nearest_bundle": nearest_bundle_info,
         }
-
-    def _sort_rebars_rowwise_left_to_right(self, indices, centers):
-        if len(indices) <= 1:
-            return indices
-
-        pairs = list(zip(indices, centers))
-        pairs.sort(key=lambda x: x[1][1])  # by y
-
-        rows = []
-        current_row = []
-        current_y = pairs[0][1][1]
-
-        for idx, center in pairs:
-            if abs(center[1] - current_y) <= self.row_tolerance:
-                current_row.append((idx, center))
-            else:
-                if current_row:
-                    current_row.sort(key=lambda x: x[1][0])  # by x
-                    rows.extend([i for i, _ in current_row])
-                current_row = [(idx, center)]
-                current_y = center[1]
-
-        if current_row:
-            current_row.sort(key=lambda x: x[1][0])
-            rows.extend([i for i, _ in current_row])
-
-        return np.array(rows)
+        
+        return self._make_json_safe(result)
 
     def _get_row_number(self, center, all_centers):
         y_coords = sorted(set([float(c[1]) for c in all_centers]))
@@ -290,8 +457,129 @@ class RebarBundleDetector:
         return np.array(centers, dtype=np.float32), np.array(sizes, dtype=np.float32)
 
     # ------------------------------------------------------------------
-    # Detection helpers & ONNX inference
+    # Depth-based filtering
     # ------------------------------------------------------------------
+    def filter_by_depth(
+        self,
+        boxes: np.ndarray,
+        scores: np.ndarray,
+        coeffs: Optional[np.ndarray],
+        depth_map: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        if len(boxes) == 0 or depth_map is None:
+            return boxes, scores, coeffs
+        
+        try:
+            from backend.services.oak_utils import get_depth_at_point
+        except ImportError:
+            return boxes, scores, coeffs
+        
+        keep_mask = np.zeros(len(boxes), dtype=bool)
+        
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = map(int, box[:4])
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            
+            depth_mm = get_depth_at_point(depth_map, cx, cy, sample_radius=5)
+            
+            if depth_mm is not None:
+                if (self.min_detection_distance_mm <= depth_mm <= self.max_detection_distance_mm):
+                    keep_mask[i] = True
+        
+        filtered_boxes = boxes[keep_mask]
+        filtered_scores = scores[keep_mask]
+        filtered_coeffs = coeffs[keep_mask] if coeffs is not None else None
+        
+        return filtered_boxes, filtered_scores, filtered_coeffs
+
+    # ------------------------------------------------------------------
+    # Drawing methods - Annotate only counted rebars with bundle-specific IDs
+    # ------------------------------------------------------------------
+    def annotate_counted_bundles(self, image_bgr, boxes, bundle_info, counted_bundle_ids):
+        """
+        Annotate ONLY the rebars in bundles that are counted.
+        Each bundle has its own IDs starting from 1 (top to bottom).
+        
+        Args:
+            image_bgr: Original image
+            boxes: All detection boxes
+            bundle_info: Bundle info from detect_bundles
+            counted_bundle_ids: Set of bundle IDs that should be annotated
+        """
+        img = image_bgr.copy()
+        
+        if not bundle_info:
+            return img
+        
+        bundles = bundle_info.get("bundles", [])
+        id_mapping = bundle_info.get("id_mapping", {})
+        
+        # Get all rebar indices from counted bundles only
+        counted_rebar_indices = set()
+        for bundle in bundles:
+            if bundle.get("bundle_id") in counted_bundle_ids:
+                for rebar in bundle.get("rebars", []):
+                    counted_rebar_indices.add(rebar["global_index"])
+        
+        # Annotate only counted rebars with their unique IDs (bundle-specific)
+        for global_idx, id_info in id_mapping.items():
+            if global_idx in counted_rebar_indices and global_idx < len(boxes):
+                box = boxes[global_idx]
+                x1, y1, x2, y2 = map(int, box[:4])
+                display_id = str(id_info["display_id"])
+                
+                # Calculate center of the rebar
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+                
+                # Draw the unique ID centered in the rebar
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                
+                # Adjust font size based on rebar size
+                box_size = min(x2 - x1, y2 - y1)
+                if box_size < 25:
+                    font_scale, thickness = 0.4, 1
+                elif box_size < 40:
+                    font_scale, thickness = 0.5, 1
+                elif box_size < 70:
+                    font_scale, thickness = 0.6, 2
+                elif box_size < 120:
+                    font_scale, thickness = 0.7, 2
+                else:
+                    font_scale, thickness = 0.8, 2
+                
+                # Get text size
+                (text_w, text_h), _ = cv2.getTextSize(display_id, font, font_scale, thickness)
+                
+                # Position text centered in the rebar
+                text_x = cx - text_w // 2
+                text_y = cy + text_h // 2
+                
+                # Draw background rectangle for text
+                padding = 4
+                cv2.rectangle(
+                    img,
+                    (text_x - padding, text_y - text_h - padding),
+                    (text_x + text_w + padding, text_y + padding),
+                    (0, 0, 0),
+                    -1
+                )
+                
+                # Draw the ID text
+                cv2.putText(
+                    img,
+                    display_id,
+                    (text_x, text_y),
+                    font,
+                    font_scale,
+                    (255, 255, 255),
+                    thickness,
+                    cv2.LINE_AA,
+                )
+        
+        return img
+
     def fetch_snapshot(self, url: str):
         try:
             r = requests.get(url, timeout=5)
@@ -318,7 +606,7 @@ class RebarBundleDetector:
         return canvas
 
     def letterbox(self, im, new_shape=(640, 640), color=(114, 114, 114)):
-        shape = im.shape[:2]  # (h, w)
+        shape = im.shape[:2]
         if isinstance(new_shape, int):
             new_shape = (new_shape, new_shape)
 
@@ -399,18 +687,15 @@ class RebarBundleDetector:
     def parse_onnx_outputs(self, outs):
         arrs = [np.asarray(o) for o in outs]
 
-        # ---- YOLO Segmentation ONNX: (pred, proto) ----
         if len(arrs) == 2 and arrs[0].ndim == 3 and arrs[1].ndim == 4:
             return "seg", (arrs[0], arrs[1])
 
-        # ---- NMS-like outputs ----
         for a in arrs:
             if a.ndim == 3 and a.shape[-1] == 6:
                 return "nms", (a[0] if a.shape[0] == 1 else a)
             if a.ndim == 2 and a.shape[-1] == 6:
                 return "nms", a
 
-        # ---- fallback raw outputs ----
         z = arrs[0]
         if z.ndim == 3:
             if z.shape[1] < z.shape[2]:
@@ -435,23 +720,19 @@ class RebarBundleDetector:
         return img, r, dwdh
 
     # ------------------------------------------------------------------
-    # Segmentation masks (decoded + HARD-CLIPPED to bbox)
+    # Segmentation masks
     # ------------------------------------------------------------------
     def decode_seg_masks(
         self,
-        coeffs: np.ndarray,          # [N, nm]
-        proto: np.ndarray,           # [nm, mh, mw]
-        boxes_xyxy_orig: np.ndarray, # [N, 4] in ORIGINAL image coords (after scale_boxes + NMS)
+        coeffs: np.ndarray,
+        proto: np.ndarray,
+        boxes_xyxy_orig: np.ndarray,
         r: float,
         dwdh: Tuple[float, float],
         orig_shape,
         in_hw: Tuple[int, int],
         mask_thresh: float = 0.5,
     ) -> List[np.ndarray]:
-        """
-        Decode YOLO-seg masks and HARD-CLIP each mask to its own bounding box in original image space.
-        This removes the background rainbow noise completely.
-        """
         if coeffs is None or len(coeffs) == 0:
             return []
 
@@ -459,25 +740,21 @@ class RebarBundleDetector:
         orig_h, orig_w = orig_shape[:2]
         left, top = map(int, dwdh)
 
-        proto = proto.astype(np.float32)      # [nm, mh, mw]
-        coeffs = coeffs.astype(np.float32)    # [N, nm]
+        proto = proto.astype(np.float32)
+        coeffs = coeffs.astype(np.float32)
 
         nm, mh, mw = proto.shape
-        proto_flat = proto.reshape(nm, -1)    # [nm, mh*mw]
+        proto_flat = proto.reshape(nm, -1)
 
-        # masks at proto resolution: [N, mh, mw]
         masks = self.sigmoid(coeffs @ proto_flat).reshape(-1, mh, mw)
 
-        # content size in model-input after letterbox
         new_w = int(round(orig_w * float(r)))
         new_h = int(round(orig_h * float(r)))
 
         out_masks: List[np.ndarray] = []
         for i, m in enumerate(masks):
-            # 1) upsample proto mask -> model input size (e.g., 640x640)
             m_in = cv2.resize(m, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
 
-            # 2) remove padding -> get mask on resized-content area
             x1p = max(left, 0)
             y1p = max(top, 0)
             x2p = min(left + new_w, in_w)
@@ -487,19 +764,15 @@ class RebarBundleDetector:
                 continue
 
             m_crop = m_in[y1p:y2p, x1p:x2p]
-
-            # 3) resize to original image size
             m_orig = cv2.resize(m_crop, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
             m_bin = (m_orig >= float(mask_thresh))
 
-            # 4) HARD CLIP mask to its bbox in ORIGINAL image coords (key fix)
             bx1, by1, bx2, by2 = boxes_xyxy_orig[i]
             x1 = int(max(0, np.floor(bx1)))
             y1 = int(max(0, np.floor(by1)))
             x2 = int(min(orig_w, np.ceil(bx2)))
             y2 = int(min(orig_h, np.ceil(by2)))
 
-            # zero everything outside the box
             if y1 > 0:
                 m_bin[:y1, :] = False
             if y2 < orig_h:
@@ -514,10 +787,7 @@ class RebarBundleDetector:
         return out_masks
 
     def _color_for_index(self, i: int) -> Tuple[int, int, int]:
-        """
-        Deterministic vivid BGR color for instance i (OpenCV uses BGR).
-        """
-        h = int((i * 37) % 180)  # 0..179 in OpenCV HSV
+        h = int((i * 37) % 180)
         hsv = np.uint8([[[h, 255, 255]]])
         bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
         return int(bgr[0]), int(bgr[1]), int(bgr[2])
@@ -543,7 +813,6 @@ class RebarBundleDetector:
 
             color = colors[i]
 
-            # alpha blend only on mask pixels
             out[m] = (
                 out[m].astype(np.float32) * (1.0 - float(alpha))
                 + np.array(color, dtype=np.float32) * float(alpha)
@@ -558,160 +827,18 @@ class RebarBundleDetector:
         return out
 
     # ------------------------------------------------------------------
-    # Drawing
-    # ------------------------------------------------------------------
-    def draw_simple_black_frame(self, img, summary):
-        frame_width = 220
-        frame_height = 140
-        x1, y1 = 10, 10
-        x2, y2 = x1 + frame_width, y1 + frame_height
-
-        overlay = img.copy()
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
-        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 1)
-
-        title = "REBAR ANALYSIS"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(img, title, (x1 + 15, y1 + 25), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.line(img, (x1 + 10, y1 + 35), (x2 - 10, y1 + 35), (255, 255, 255), 1)
-
-        y_offset = y1 + 50
-        line_height = 18
-        cv2.putText(img, f"TOTAL: {summary['total']}", (x1 + 15, y_offset), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-        y_offset += line_height
-        cv2.putText(img, f"BUNDLES: {summary['bundles']}", (x1 + 15, y_offset), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-        y_offset += line_height
-        cv2.putText(img, f"IN BUNDLES: {summary['rebars_in_bundles']}", (x1 + 15, y_offset), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-        y_offset += line_height
-        cv2.putText(img, f"ISOLATED: {summary['isolated']}", (x1 + 15, y_offset), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-        return img
-
-    def draw_centered_ids_with_bundles(self, image_bgr, boxes, bundle_info=None, box_colors=None):
-        """
-        Draw per-instance colored bounding boxes (if box_colors provided),
-        centered IDs, and summary frame.
-        """
-        img = image_bgr.copy()
-        img_height, img_width = img.shape[:2]
-
-        # Draw all boxes (instance-colored)
-        for i, box in enumerate(boxes):
-            x1, y1, x2, y2 = map(int, box[:4])
-            if box_colors is not None and i < len(box_colors) and box_colors[i] is not None:
-                color = tuple(map(int, box_colors[i]))
-            else:
-                color = (0, 255, 0)
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-
-        # Draw IDs using bundle mapping
-        if bundle_info and bundle_info.get("total_count", 0) > 0:
-            for global_idx, id_info in bundle_info["id_mapping"].items():
-                if global_idx < len(boxes):
-                    box = boxes[global_idx]
-                    x1, y1, x2, y2 = map(int, box[:4])
-                    box_w = x2 - x1
-                    box_h = y2 - y1
-                    box_size = min(box_w, box_h)
-
-                    if box_size < 25:
-                        font_scale, thickness = 0.25, 1
-                    elif box_size < 40:
-                        font_scale, thickness = 0.30, 1
-                    elif box_size < 70:
-                        font_scale, thickness = 0.35, 1
-                    elif box_size < 120:
-                        font_scale, thickness = 0.40, 2
-                    elif box_size < 200:
-                        font_scale, thickness = 0.50, 2
-                    else:
-                        font_scale, thickness = 0.60, 2
-
-                    display_id = str(id_info["display_id"])
-                    cx = int((x1 + x2) / 2)
-                    cy = int((y1 + y2) / 2)
-
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    (tw, th), _ = cv2.getTextSize(display_id, font, font_scale, thickness)
-                    padding = max(2, int(font_scale * 3))
-
-                    bg_x1 = max(0, cx - tw // 2 - padding)
-                    bg_y1 = max(0, cy - th // 2 - padding)
-                    bg_x2 = min(img_width, cx + tw // 2 + padding)
-                    bg_y2 = min(img_height, cy + th // 2 + padding)
-
-                    cv2.rectangle(img, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
-                    cv2.putText(
-                        img,
-                        display_id,
-                        (cx - tw // 2, cy + th // 2),
-                        font,
-                        font_scale,
-                        (255, 255, 255),
-                        thickness,
-                        cv2.LINE_AA,
-                    )
-
-            img = self.draw_simple_black_frame(img, bundle_info["display_summary"])
-        else:
-            # simple numbering fallback
-            for idx, box in enumerate(boxes, start=1):
-                x1, y1, x2, y2 = map(int, box[:4])
-                box_size = min(x2 - x1, y2 - y1)
-
-                if box_size < 30:
-                    font_scale, thickness = 0.3, 1
-                elif box_size < 60:
-                    font_scale, thickness = 0.4, 1
-                else:
-                    font_scale, thickness = 0.5, 2
-
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
-                id_text = str(idx)
-                (tw, th), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-
-                cv2.rectangle(
-                    img,
-                    (cx - tw // 2 - 2, cy - th // 2 - 2),
-                    (cx + tw // 2 + 2, cy + th // 2 + 2),
-                    (0, 0, 0),
-                    -1,
-                )
-                cv2.putText(
-                    img,
-                    id_text,
-                    (cx - tw // 2, cy + th // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,
-                    (255, 255, 255),
-                    thickness,
-                    cv2.LINE_AA,
-                )
-
-            summary = {
-                "total": len(boxes),
-                "bundles": 0,
-                "rebars_in_bundles": 0,
-                "isolated": len(boxes),
-            }
-            img = self.draw_simple_black_frame(img, summary)
-
-        return img, boxes
-
-    # ------------------------------------------------------------------
-    # Core detect (supports DET + SEG ONNX)
+    # Core detect
     # ------------------------------------------------------------------
     def detect_rebars(
         self,
         image_bgr,
         model,
+        depth_map: Optional[np.ndarray] = None,
         class_id: int = 0,
-        conf: float = 0.25,
-        iou: float = 0.5,
+        conf: float = 0.5,
+        iou: float = 0.3,
         max_det: int = 10000,
     ):
-        # Guard
         if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return None, 0, "Empty image (None) passed to detect_rebars()", None
 
@@ -725,39 +852,31 @@ class RebarBundleDetector:
             outs = sess.run(None, {in_name: blob})
             kind, data = self.parse_onnx_outputs(outs)
 
-            if self.debug:
-                print("[detect_rebars] kind=", kind, "outs shapes=", [np.asarray(o).shape for o in outs])
-
             dets_xyxy = []
             seg_masks: Optional[List[np.ndarray]] = None
             instance_colors: Optional[List[Tuple[int, int, int]]] = None
 
-            # ------------------------
-            # SEGMENTATION branch
-            # ------------------------
+            # Segmentation branch
             if kind == "seg":
                 pred_raw, proto_raw = data
-                pred = pred_raw[0]   # [no, anchors] OR [anchors, no]
-                proto = proto_raw[0] # [nm, mh, mw]
+                pred = pred_raw[0]
+                proto = proto_raw[0]
 
-                # Your model output0 is [1, 37, anchors] => pred is [37, anchors] -> transpose
                 if pred.ndim != 2:
-                    raise ValueError(f"Unexpected seg pred ndim={pred.ndim}, shape={pred.shape}")
+                    raise ValueError(f"Unexpected seg pred ndim={pred.ndim}")
                 if pred.shape[0] <= 128 and pred.shape[1] > pred.shape[0]:
-                    pred = pred.T  # [anchors, 37]
+                    pred = pred.T
 
                 pred = pred.astype(np.float32)
                 no = int(pred.shape[1])
                 nm = int(proto.shape[0])
 
-                # YOLO-seg typical: no = 4 + nc + nm  (your: 37=4+1+32)
                 nc = no - 4 - nm
                 if nc <= 0:
                     nc = 1
 
                 boxes = pred[:, 0:4].copy()
 
-                # scores (class probability)
                 scores_mat = self.maybe_sigmoid(pred[:, 4 : 4 + nc])
                 if scores_mat.ndim == 1:
                     scores_mat = scores_mat[:, None]
@@ -765,23 +884,19 @@ class RebarBundleDetector:
                     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), 0, "class_id out of range", None
                 scores = scores_mat[:, int(class_id)]
 
-                # mask coeffs
                 coeff_start = 4 + nc
                 coeff_end = coeff_start + nm
                 if coeff_end > no:
-                    # fallback if export uses [x,y,w,h,conf,coeffs...]
                     coeff_start = 5
                     coeff_end = 5 + nm
                 coeffs = pred[:, coeff_start:coeff_end].copy()
                 if coeffs.shape[1] != nm:
-                    raise ValueError(f"Bad coeffs shape {coeffs.shape}, expected nm={nm}, no={no}")
+                    raise ValueError(f"Bad coeffs shape {coeffs.shape}")
 
-                # normalized -> pixels in model input
                 if np.nanmax(boxes) <= 1.5:
                     boxes[:, [0, 2]] *= float(in_w)
                     boxes[:, [1, 3]] *= float(in_h)
 
-                # decide xywh vs xyxy
                 b_xyxy_from_xywh = self.xywh2xyxy(boxes.copy())
                 valid1 = (
                     (b_xyxy_from_xywh[:, 2] > b_xyxy_from_xywh[:, 0]) &
@@ -800,10 +915,8 @@ class RebarBundleDetector:
                     s = scores[keep_mask]
                     coeffs = coeffs[keep_mask]
 
-                    # scale to original image coords
                     b_xyxy = self.scale_boxes(b_xyxy, r, dwdh, image_bgr.shape)
 
-                    # remove tiny
                     wh = (b_xyxy[:, 2:4] - b_xyxy[:, 0:2]).clip(min=0)
                     small = (wh[:, 0] < 4.0) | (wh[:, 1] < 4.0)
                     if np.any(small):
@@ -820,26 +933,31 @@ class RebarBundleDetector:
                     keep = self.nms(b_xyxy, s, iou_thres=float(iou), max_det=max_det)
                     if keep:
                         b_xyxy = b_xyxy[keep]
+                        s = s[keep]
                         coeffs = coeffs[keep]
-                        dets_xyxy = b_xyxy.tolist()
 
-                        if self.draw_seg_masks:
-                            # HARD-CLIP masks to bbox -> removes background rainbow
-                            seg_masks = self.decode_seg_masks(
-                                coeffs=coeffs,
-                                proto=proto,
-                                boxes_xyxy_orig=b_xyxy,  # IMPORTANT
-                                r=float(r),
-                                dwdh=dwdh,
-                                orig_shape=image_bgr.shape,
-                                in_hw=in_hw,
-                                mask_thresh=float(self.seg_mask_thresh),
+                        if self.use_depth_filter and depth_map is not None:
+                            b_xyxy, s, coeffs = self.filter_by_depth(
+                                b_xyxy, s, coeffs, depth_map
                             )
-                            instance_colors = [self._color_for_index(i) for i in range(len(seg_masks))]
 
-            # ------------------------
-            # DETECTION (NMS-like) branch
-            # ------------------------
+                        if len(b_xyxy) > 0:
+                            dets_xyxy = b_xyxy.tolist()
+
+                            if self.draw_seg_masks:
+                                seg_masks = self.decode_seg_masks(
+                                    coeffs=coeffs,
+                                    proto=proto,
+                                    boxes_xyxy_orig=b_xyxy,
+                                    r=float(r),
+                                    dwdh=dwdh,
+                                    orig_shape=image_bgr.shape,
+                                    in_hw=in_hw,
+                                    mask_thresh=float(self.seg_mask_thresh),
+                                )
+                                instance_colors = [self._color_for_index(i) for i in range(len(seg_masks))]
+
+            # Detection (NMS-like) branch
             elif kind == "nms":
                 d = data.reshape(-1, 6).astype(np.float32)
                 cls = np.round(d[:, 5]).astype(np.int32)
@@ -847,15 +965,19 @@ class RebarBundleDetector:
                 mask = (scr >= conf) & (cls == int(class_id))
                 if np.any(mask):
                     b = d[mask, :4]
+                    s = scr[mask]
                     if np.nanmax(b) <= 1.5:
                         b[:, [0, 2]] *= float(in_w)
                         b[:, [1, 3]] *= float(in_h)
                     b = self.scale_boxes(b, r, dwdh, image_bgr.shape)
-                    dets_xyxy = b.tolist()
+                    
+                    if self.use_depth_filter and depth_map is not None:
+                        b, s, _ = self.filter_by_depth(b, s, None, depth_map)
+                    
+                    if len(b) > 0:
+                        dets_xyxy = b.tolist()
 
-            # ------------------------
-            # DETECTION (raw YOLO-style) branch
-            # ------------------------
+            # Detection (raw) branch
             else:
                 z = data
                 C = z.shape[1]
@@ -925,17 +1047,20 @@ class RebarBundleDetector:
                     keep = self.nms(b_xyxy, s, iou_thres=float(iou), max_det=max_det)
                     if keep:
                         b_xyxy = b_xyxy[keep]
-                        dets_xyxy = b_xyxy.tolist()
+                        s = s[keep]
+                        
+                        if self.use_depth_filter and depth_map is not None:
+                            b_xyxy, s, _ = self.filter_by_depth(b_xyxy, s, None, depth_map)
+                        
+                        if len(b_xyxy) > 0:
+                            dets_xyxy = b_xyxy.tolist()
 
-            # ------------------------
-            # Build annotation + bundle info
-            # ------------------------
+            # Build bundle info
             if dets_xyxy:
                 boxes_array = np.array(dets_xyxy, dtype=np.float32)
 
                 annotated = image_bgr.copy()
 
-                # Overlay instance-colored masks (already hard-clipped to bbox)
                 if seg_masks and instance_colors:
                     annotated = self._overlay_instance_masks(
                         annotated,
@@ -946,49 +1071,15 @@ class RebarBundleDetector:
                         contour_thickness=int(self.mask_contour_thickness),
                     )
 
-                bundle_info = self.detect_bundles(boxes_array)
-
-                # Box colors match instance mask colors
-                box_colors = instance_colors if instance_colors and len(instance_colors) == len(boxes_array) else None
-
-                annotated, sorted_boxes = self.draw_centered_ids_with_bundles(
-                    annotated, boxes_array, bundle_info, box_colors=box_colors
-                )
-                count = int(len(sorted_boxes))
+                bundle_info = self.detect_bundles(boxes_array, depth_map)
+                count = len(boxes_array)
             else:
                 annotated = image_bgr.copy()
                 bundle_info = None
                 count = 0
 
-            # HD output with banner
-            hd = self.to_hd_1080p(annotated, background=(18, 24, 31))
-            banner_height = 100
-            img_h, img_w, _ = hd.shape
-
-            if bundle_info and bundle_info.get("total_bundles", 0) > 0:
-                heading = (
-                    f"Rebars: {count} | Bundles: {bundle_info['total_bundles']} | "
-                    f"In Bundles: {bundle_info['total_rebars_in_bundles']} | "
-                    f"Isolated: {bundle_info['total_isolated']}"
-                )
-            else:
-                heading = f"Rebars detected: {count}"
-
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            size, _ = cv2.getTextSize(heading, font, 1.5, 3)
-            cv2.rectangle(hd, (0, 0), (img_w, banner_height), (255, 255, 255), -1)
-            cv2.putText(
-                hd,
-                heading,
-                ((img_w - size[0]) // 2, (banner_height + size[1]) // 2),
-                font,
-                1.5,
-                (0, 0, 0),
-                3,
-                lineType=cv2.LINE_AA,
-            )
-
-            return cv2.cvtColor(hd, cv2.COLOR_BGR2RGB), count, None, bundle_info
+            # Return clean image without annotations (annotations will be added in main.py)
+            return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), count, None, bundle_info
 
         except Exception as e:
             try:
@@ -998,7 +1089,7 @@ class RebarBundleDetector:
             return fallback, 0, f"Detection error: {e}", None
 
     # ------------------------------------------------------------------
-    # FastAPI-oriented service methods (JSON responses)
+    # Service methods
     # ------------------------------------------------------------------
     def detect_image(self, file) -> Dict[str, Any]:
         if hasattr(file, "read"):
@@ -1006,7 +1097,7 @@ class RebarBundleDetector:
         elif isinstance(file, (bytes, bytearray)):
             content = file
         else:
-            raise ValueError("Unsupported file type for detect_image; expected bytes or file-like object.")
+            raise ValueError("Unsupported file type")
 
         nparr = np.frombuffer(content, np.uint8)
         image_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -1019,7 +1110,22 @@ class RebarBundleDetector:
                 "image": None,
             }
 
-        annotated_rgb, count, error, bundle_info = self.detect_rebars(image_bgr, model)
+        annotated_rgb, count, error, bundle_info = self.detect_rebars(image_bgr, model, depth_map=None)
+        
+        # For uploaded images, annotate all bundles
+        if bundle_info and bundle_info.get("bundles"):
+            all_boxes = []
+            for bundle in bundle_info.get("bundles", []):
+                for rebar in bundle.get("rebars", []):
+                    all_boxes.append(rebar["box"])
+            if all_boxes:
+                boxes_array = np.array(all_boxes, dtype=np.float32)
+                counted_bundle_ids = set([b["bundle_id"] for b in bundle_info.get("bundles", [])])
+                annotated_result = self.annotate_counted_bundles(
+                    image_bgr, boxes_array, bundle_info, counted_bundle_ids
+                )
+                annotated_rgb = cv2.cvtColor(annotated_result, cv2.COLOR_BGR2RGB)
+        
         image_data = img_to_data_uri(annotated_rgb) if annotated_rgb is not None else None
 
         return {
@@ -1029,8 +1135,16 @@ class RebarBundleDetector:
             "image": image_data,
         }
 
-    def detect_oak_camera(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
-        annotated_rgb, count, error, bundle_info = self.detect_rebars(frame_bgr, model)
+    def detect_oak_camera(
+        self, 
+        frame_bgr: np.ndarray,
+        depth_map: Optional[np.ndarray] = None
+    ) -> Dict[str, Any]:
+        annotated_rgb, count, error, bundle_info = self.detect_rebars(
+            frame_bgr, 
+            model,
+            depth_map=depth_map
+        )
         image_data = img_to_data_uri(annotated_rgb) if annotated_rgb is not None else None
 
         return {
@@ -1042,7 +1156,7 @@ class RebarBundleDetector:
 
 
 # ------------------------------------------------------------------
-# Model loading (ONNX Runtime)
+# Model loading
 # ------------------------------------------------------------------
 def _parse_in_hw(onnx_input_shape, default_hw=(640, 640)):
     def _to_int(v, default):
@@ -1091,7 +1205,7 @@ model = load_model()
 
 
 # ------------------------------------------------------------------
-# Detection record helpers (DB)
+# DB helpers
 # ------------------------------------------------------------------
 def save_image_files(image_rgb: np.ndarray, det_id: str):
     img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
@@ -1125,14 +1239,25 @@ def record_detection(
     bundle_json = None
     if bundle_info:
         import json
-
-        bundle_json = json.dumps(
-            {
-                "total_bundles": bundle_info.get("total_bundles", 0),
-                "rebars_in_bundles": bundle_info.get("total_rebars_in_bundles", 0),
-                "isolated": bundle_info.get("total_isolated", 0),
-            }
-        )
+        
+        safe_bundle_info = RebarBundleDetector()._make_json_safe(bundle_info)
+        bundle_json = json.dumps({
+            "total_bundles": safe_bundle_info.get("total_bundles", 0),
+            "rebars_in_bundles": safe_bundle_info.get("total_rebars_in_bundles", 0),
+            "isolated": safe_bundle_info.get("total_isolated", 0),
+            "nearest_bundle": safe_bundle_info.get("nearest_bundle"),
+            "bundles": [
+                {
+                    "bundle_id": b["bundle_id"],
+                    "size": b["size"],
+                    "distance_m": b.get("distance_m"),
+                    "distance_mm": b.get("distance_mm"),
+                    "is_nearest": b.get("is_nearest", False),
+                    "counted": b.get("counted", True)
+                }
+                for b in safe_bundle_info.get("bundles", [])
+            ]
+        })
 
     cur.execute(
         """
@@ -1224,7 +1349,7 @@ def delete_detection(det_id: str, user_id: int):
 
 
 # ------------------------------------------------------------------
-# Image → data URI helpers
+# Image to data URI helpers
 # ------------------------------------------------------------------
 def img_to_data_uri(
     image_rgb: np.ndarray, quality: int = 90, max_w: Optional[int] = None

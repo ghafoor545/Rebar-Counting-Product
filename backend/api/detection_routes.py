@@ -1,3 +1,4 @@
+# backend/routes/detection_routes.py
 
 from typing import Any, Dict, List, Optional
 import os
@@ -5,7 +6,7 @@ import io
 import json
 from uuid import uuid4
 from pathlib import Path
-from datetime import datetime  # ✅ for timestamp formatting
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -24,7 +25,7 @@ from backend.services.detector import (
     img_to_data_uri,
     file_to_data_uri,
 )
-from backend.services.oak_utils import grab_oak_frame
+from backend.services.oak_utils import grab_oak_frame  # Updated import
 from backend.oled_display import (
     oled_show_processing,
     oled_show_count,
@@ -36,13 +37,18 @@ router = APIRouter(prefix="/detections", tags=["detections"])
 # OAK session store
 OAK_SESSION: Dict[str, Any] = {}
 
-# Detection service instance
+# Detection service instance with depth filtering enabled
 detector_service = RebarBundleDetector(
     eps=100.0,
     min_bundle_size=5,
     min_samples=2,
     row_tolerance=40.0,
     use_adaptive_eps=True,
+    # Enable depth filtering for OAK-D Pro
+    use_depth_filter=True,
+    max_detection_distance_mm=1500.0,  # 1.5 meters - adjust as needed
+    min_detection_distance_mm=200.0,   # 20 cm
+    debug=False,  # Set True to see depth filter logs
 )
 
 # -------------------------
@@ -244,8 +250,9 @@ def capture_from_ip(
             "snapshot_url": snapshot_url,
         }
 
+    # No depth data for IP webcam
     annotated_rgb, count, derr, bundle_info = detector_service.detect_rebars(
-        img_bgr, model, conf=0.6, iou=0.5, max_det=10000
+        img_bgr, model, depth_map=None, conf=0.5, iou=0.3, max_det=10000
     )
     if derr:
         try:
@@ -291,19 +298,21 @@ def capture_from_ip(
 
 
 # ---------------------------------------------------------
-# Capture & Count from OAK-D (Direct backend capture - Alt)
+# Capture & Count from OAK-D (WITH DEPTH FILTERING) ✅
 # ---------------------------------------------------------
 @router.post("/capture/oak")
 def capture_from_oak(user_id: int = Form(...)):
     """
-    Capture & Count from OAK-D Pro (Direct backend capture).
+    Capture & Count from OAK-D Pro with depth filtering.
     """
     try:
         oled_show_processing()
     except Exception:
         pass
 
-    frame, oerr = grab_oak_frame(OAK_SESSION, wait_sec=2.0)
+    # Updated: grab_oak_frame now returns (rgb_frame, depth_map, error)
+    frame, depth_map, oerr = grab_oak_frame(OAK_SESSION, wait_sec=2.0)
+    
     if oerr or frame is None:
         try:
             oled_show_message("OAK Error", (oerr or "")[:12])
@@ -319,9 +328,11 @@ def capture_from_oak(user_id: int = Form(...)):
             "stream_source": "OAK-D Pro",
         }
 
+    # Pass depth_map to enable depth filtering
     annotated_rgb, count, derr, bundle_info = detector_service.detect_rebars(
-        frame, model, conf=0.6, iou=0.5, max_det=10000
+        frame, model, depth_map=depth_map, conf=0.5, iou=0.3, max_det=10000
     )
+    
     if derr:
         try:
             oled_show_message("Detect Error", derr[:12])
@@ -370,9 +381,7 @@ def capture_from_oak(user_id: int = Form(...)):
 async def detect_uploaded_image(
     user_id: int = Form(...),
     file: UploadFile = File(...),
-    stream_url: Optional[str] = Form(
-        None
-    ),  # Allows overriding "Upload" label (e.g. "OAK-D Pro")
+    stream_url: Optional[str] = Form(None),
 ):
     try:
         oled_show_processing()
@@ -412,9 +421,11 @@ async def detect_uploaded_image(
             "source": "Upload",
         }
 
+    # No depth data for uploaded images
     annotated_rgb, count, derr, bundle_info = detector_service.detect_rebars(
-        img_bgr, model, conf=0.6, iou=0.5, max_det=10000
+        img_bgr, model, depth_map=None, conf=0.5, iou=0.3, max_det=10000
     )
+    
     if derr:
         try:
             oled_show_message("Detect Error", derr[:12])
@@ -511,7 +522,6 @@ def list_user_detections(
 
 # -----------------------------------------
 # Export detections history to Excel
-# (IMPORTANT: defined BEFORE "/{det_id}" route)
 # -----------------------------------------
 @router.get("/export")
 def export_detections_excel(
@@ -520,8 +530,6 @@ def export_detections_excel(
 ):
     """
     Export user's detections to an Excel file (XLSX) with thumbnail images.
-
-    Columns: ID(1..N), Timestamp, Stream, Snapshot, Count (DB), Bundles, Isolated, Image
     """
     rows, total = list_detections(user_id, page=1, per_page=limit)
 
@@ -529,7 +537,6 @@ def export_detections_excel(
     ws = wb.active
     ws.title = "Detections"
 
-    # Header row
     headers = [
         "ID",
         "Timestamp",
@@ -542,15 +549,14 @@ def export_detections_excel(
     ]
     ws.append(headers)
 
-    # Column widths
-    ws.column_dimensions["A"].width = 6   # ID (1..N)
-    ws.column_dimensions["B"].width = 22  # Timestamp
-    ws.column_dimensions["C"].width = 18  # Stream
-    ws.column_dimensions["D"].width = 26  # Snapshot
-    ws.column_dimensions["E"].width = 10  # Count
-    ws.column_dimensions["F"].width = 10  # Bundles
-    ws.column_dimensions["G"].width = 10  # Isolated
-    ws.column_dimensions["H"].width = 22  # Image
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 26
+    ws.column_dimensions["E"].width = 10
+    ws.column_dimensions["F"].width = 10
+    ws.column_dimensions["G"].width = 10
+    ws.column_dimensions["H"].width = 22
 
     start_row = 2
     img_col_letter = "H"
@@ -562,10 +568,8 @@ def export_detections_excel(
         rd = _row_to_dict(r)
         row_index = start_row + idx
 
-        # Row ID (1..N for this export)
         display_id = idx + 1
 
-        # Parse bundle_info
         bi_raw = rd.get("bundle_info")
         if isinstance(bi_raw, str):
             try:
@@ -579,21 +583,18 @@ def export_detections_excel(
         in_bundles = bi.get("rebars_in_bundles", 0) or 0
         isolated = bi.get("isolated") or bi.get("total_isolated") or 0
 
-        # Use DB "count" as primary Count value
         db_count = rd.get("count", 0) or 0
         display_count = db_count
 
-        # ✅ format timestamp nicely (YYYY-MM-DD HH:MM:SS)
         ts_raw = rd.get("timestamp")
         ts_display = ts_raw
         if ts_raw:
-          # handle ISO with 'Z' (UTC)
-          try:
-            ts_norm = ts_raw.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(ts_norm)
-            ts_display = dt.strftime("%Y-%m-%d %H:%M:%S")
-          except Exception:
-            ts_display = ts_raw
+            try:
+                ts_norm = ts_raw.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(ts_norm)
+                ts_display = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts_display = ts_raw
 
         ws.cell(row=row_index, column=1, value=display_id)
         ws.cell(row=row_index, column=2, value=ts_display)
