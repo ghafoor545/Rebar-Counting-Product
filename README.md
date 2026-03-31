@@ -122,3 +122,4 @@ Open:
 ## License
 
 MIT / internal project use
+\nDeveloped by DR Rooshan Butt and Engineer Ghafoor Khan\n
