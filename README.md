@@ -22,7 +22,6 @@ A full-stack application to detect and count reinforcement bars (rebars) from im
 - OpenCV, NumPy, scikit-learn
 - PostgreSQL (or local SQLite fallback)
 - React + Vite
-- es: source reference for this repository
 
 ## Project Structure
 
@@ -119,6 +118,10 @@ Open:
 3. Implement feature/bugfix
 4. `git add`, `git commit`, `git push`
 5. Open PR with details
+
+## Dataset
+
+- Dataset link: https://drive.google.com/drive/folders/1nRbFkrkRTX-c68KBgTtgzdnmnViZjLbO?usp=sharing
 
 ## License
 
