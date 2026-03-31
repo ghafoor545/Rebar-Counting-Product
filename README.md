@@ -22,6 +22,7 @@ A full-stack application to detect and count reinforcement bars (rebars) from im
 - OpenCV, NumPy, scikit-learn
 - PostgreSQL (or local SQLite fallback)
 - React + Vite
+- es: source reference for this repository
 
 ## Project Structure
 
