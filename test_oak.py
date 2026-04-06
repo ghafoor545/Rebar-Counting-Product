@@ -1,33 +1,66 @@
-# test_oak.py
-import cv2
+import time
+import threading
 import depthai as dai
 
-pipeline = dai.Pipeline()
+def check_oak_camera(timeout_sec: float = 3.0) -> bool:
+    """
+    Check if an OAK camera is present and can produce frames.
+    Returns True if working, False otherwise (never hangs).
+    """
+    # 1. Quick device presence check (non‑blocking)
+    devices = dai.Device.getAllAvailableDevices()
+    if not devices:
+        print("[ERROR] No OAK device found.")
+        return False
+    print(f"[INFO] Found {len(devices)} OAK device(s).")
 
-# RGB Camera
-cam_rgb = pipeline.create(dai.node.ColorCamera)
-cam_rgb.setBoardSocket(dai.CameraBoardSocket.RGB)
-cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-cam_rgb.setInterleaved(False)
-cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-cam_rgb.setFps(30)
+    # 2. Try to open a pipeline and capture one frame with timeout
+    result = {"success": False, "frame": None}
 
-xout_rgb = pipeline.create(dai.node.XLinkOut)
-xout_rgb.setStreamName("rgb")
-cam_rgb.video.link(xout_rgb.input)
+    def attempt_open_and_grab():
+        try:
+            # Minimal pipeline
+            pipeline = dai.Pipeline()
+            cam = pipeline.create(dai.node.ColorCamera)
+            cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+            cam.setInterleaved(False)
+            cam.setFps(30)
 
-with dai.Device(pipeline) as device:
-    q_rgb = device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
-    
-    print("OAK-D is working! Press 'q' to quit...")
-    
-    while True:
-        in_frame = q_rgb.get()
-        frame = in_frame.getCvFrame()
-        
-        cv2.imshow("OAK-D Test", frame)
-        
-        if cv2.waitKey(1) == ord('q'):
-            break
-    
-    cv2.destroyAllWindows()
+            xout = pipeline.create(dai.node.XLinkOut)
+            xout.setStreamName("rgb")
+            cam.video.link(xout.input)
+
+            device = dai.Device(pipeline)
+            queue = device.getOutputQueue("rgb", maxSize=1, blocking=False)
+
+            start = time.time()
+            while time.time() - start < timeout_sec:
+                if queue.has():
+                    frame = queue.get().getCvFrame()
+                    if frame is not None and frame.size > 0:
+                        result["success"] = True
+                        result["frame"] = frame
+                        break
+                time.sleep(0.02)
+            device.close()
+        except Exception as e:
+            print(f"[ERROR] Pipeline failed: {e}")
+
+    # Run the pipeline attempt in a separate thread
+    thread = threading.Thread(target=attempt_open_and_grab)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout_sec + 1.0)  # extra margin
+
+    if result["success"]:
+        print("[OK] Camera is working (frame received).")
+        return True
+    else:
+        print("[ERROR] Timeout or failure – camera not responsive.")
+        return False
+
+if __name__ == "__main__":
+    if check_oak_camera():
+        print("Camera ready.")
+    else:
+        print("Camera not available.")

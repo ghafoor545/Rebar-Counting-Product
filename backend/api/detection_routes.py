@@ -252,7 +252,7 @@ def capture_from_ip(
 
     # No depth data for IP webcam
     annotated_rgb, count, derr, bundle_info = detector_service.detect_rebars(
-        img_bgr, model, depth_map=None, conf=0.5, iou=0.3, max_det=10000
+        img_bgr, model, depth_map=None, conf=0.25, iou=0.7, max_det=10000
     )
     if derr:
         try:
