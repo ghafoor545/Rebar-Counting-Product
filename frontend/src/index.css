@@ -1,0 +1,3 @@
+/* src/index.css */
+/* Forward all styling to App.css to keep a single source of truth. */
+@import "./App.css";

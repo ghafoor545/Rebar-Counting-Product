@@ -1,0 +1,22 @@
+# =========================
+# Python
+# =========================
+venv/
+__pycache__/
+*.pyc
+
+# =========================
+# ML / AI (IMPORTANT)
+# =========================
+backend/data/images/
+backend/data/thumbs/
+
+# (OPTIONAL: agar future mai ignore karna ho)
+# backend/models/
+
+# Large model formats
+*.pt
+*.pth
+
+# ONNX handled by LFS (ignore nahi karna agar LFS use ho raha hai)
+# *.onnx  ❌ (isko ignore mat karo agar LFS use kar rahe ho)
